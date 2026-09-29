@@ -9,7 +9,7 @@ from aio_utils import create_connection
 from libertem.executor.inline import InlineJobExecutor
 from libertem.executor.base import AsyncAdapter
 
-pytestmark = [pytest.mark.slow]
+pytestmark = [pytest.mark.web_api]
 
 
 def _get_raw_params(path):
@@ -92,6 +92,7 @@ async def test_load_raw_fail(base_url, http_client, local_cluster_url, default_t
         assert (
             "No such file or directory" in resp_json['msg']
             or "The system cannot find the path specified" in resp_json['msg']
+            or "WinError 3" in resp_json['msg']
         )
 
 
@@ -165,7 +166,7 @@ async def test_initial_state_after_reconnect(
             'type': 'RAW',
             'sync_offset': 0
         }
-        assert len(initial_msg["datasets"][0]["diagnostics"]) == 6
+        assert len(initial_msg["datasets"][0]["diagnostics"]) == 7
 
 
 @pytest.mark.asyncio
@@ -224,4 +225,4 @@ async def test_prime_cache(
             'type': 'RAW',
             'sync_offset': 0
         }
-        assert len(initial_msg["datasets"][0]["diagnostics"]) == 6
+        assert len(initial_msg["datasets"][0]["diagnostics"]) == 7

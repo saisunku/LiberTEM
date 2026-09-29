@@ -1,13 +1,9 @@
-from typing import (
-    Dict, Optional, Type, TYPE_CHECKING
-)
-from typing_extensions import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
-from libertem.common.buffers import BufferWrapper
 from libertem.io.dataset.base import DataSet
-from libertem.udf.base import UDF
+from libertem.udf.base import UDF, UDFResultDict
 
 # Base classes for results moved to common for MIT licensing, refs #1031
 from libertem.common.analysis import AnalysisResult, AnalysisResultSet
@@ -36,9 +32,9 @@ class Analysis:
         Removed deprecated methods :code:`get_results` and :code:`get_job`
     """
     TYPE: Literal["UDF"] = "UDF"
-    registry: Dict[str, "Type[Analysis]"] = {}
+    registry: dict[str, "type[Analysis]"] = {}
 
-    def __init__(self, dataset: DataSet, parameters: Dict):
+    def __init__(self, dataset: DataSet, parameters: dict):
         self.dataset = dataset
 
     def __init_subclass__(cls, id_=None, **kwargs):
@@ -52,22 +48,22 @@ class Analysis:
             cls.registry[id_] = cls
 
     @classmethod
-    def get_analysis_by_type(cls, id_: str) -> Type["Analysis"]:
+    def get_analysis_by_type(cls, id_: str) -> type["Analysis"]:
         return cls.registry[id_]
 
     @classmethod
-    def get_template_helper(cls) -> Type["GeneratorHelper"]:
+    def get_template_helper(cls) -> type["GeneratorHelper"]:
         raise NotImplementedError()
 
     @classmethod
-    def get_rpc_definitions(cls) -> Dict[str, Type["ProcedureProtocol"]]:
+    def get_rpc_definitions(cls) -> dict[str, type["ProcedureProtocol"]]:
         return {}
 
     async def controller(self, cancel_id, executor, job_is_cancelled, send_results):
         raise NotImplementedError()
 
     def get_udf_results(
-        self, udf_results: Dict[str, BufferWrapper], roi: Optional[np.ndarray],
+        self, udf_results: UDFResultDict, roi: np.ndarray | None,
         damage: "nt.ArrayLike",
     ) -> AnalysisResultSet:
         """
@@ -95,7 +91,7 @@ class Analysis:
         """
         raise NotImplementedError()
 
-    def get_roi(self) -> Optional[np.ndarray]:
+    def get_roi(self) -> np.ndarray | None:
         """
         Get the region of interest the UDF should be run on. For example,
         the parameters could describe some geometry, which this method should
@@ -111,13 +107,13 @@ class Analysis:
     def get_complex_results(self, job_result, key_prefix, title, desc, damage, default_lin=True):
         raise NotImplementedError()
 
-    def get_parameters(self, parameters: Dict) -> Dict:
+    def get_parameters(self, parameters: dict) -> dict:
         """
         Get analysis parameters. Override to set defaults
         """
         raise NotImplementedError()
 
-    def need_rerun(self, old_params: Dict, new_params: Dict) -> bool:
+    def need_rerun(self, old_params: dict, new_params: dict) -> bool:
         """
         Determine if the analysis needs to be re-run on the data. If not,
         we can just call `get_udf_results` again, for example if the parameters
@@ -150,12 +146,13 @@ class BaseAnalysis(Analysis):
 
     def get_complex_results(
             self, job_result, key_prefix, title, desc, damage, default_lin=True):
-        from libertem.viz import visualize_simple, CMAP_CIRCULAR_DEFAULT
+        from libertem.viz import visualize_simple, rgb_from_2dvector
         damage = damage & np.isfinite(job_result)
         magn = np.abs(job_result)
         angle = np.angle(job_result)
-        wheel = CMAP_CIRCULAR_DEFAULT.rgb_from_vector(
-            (job_result.real, job_result.imag, 0),
+        wheel = rgb_from_2dvector(
+            x=job_result.real,
+            y=job_result.imag,
             vmax=np.max(magn[damage])
         )
         return [
@@ -204,7 +201,7 @@ class BaseAnalysis(Analysis):
             ),
         ]
 
-    def get_parameters(self, parameters: Dict):
+    def get_parameters(self, parameters: dict):
         """
         Get analysis parameters. Override to set defaults
         """

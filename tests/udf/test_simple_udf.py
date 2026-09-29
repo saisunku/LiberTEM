@@ -5,14 +5,17 @@ import cloudpickle
 from sparseconverter import BACKENDS
 from libertem.udf.base import UDF, NoOpUDF, UDFPartRunner, UDFParams, UDFMeta
 from libertem.common.executor import Environment
+from libertem.common.udf import UDFMethod
 from libertem.io.dataset.memory import MemoryDataSet
 from libertem.io.dataset.base import TilingScheme, DataTile
 from libertem.io.dataset.raw import RawFileDataSet, RawPartition
 from libertem.utils.devices import detect
+from libertem.common.exceptions import UDFException
 from libertem.common.backend import set_use_cpu, set_use_cuda
 from libertem.common.buffers import reshaped_view
 from libertem.udf.sumsigudf import SumSigUDF
 from libertem.udf.sum import SumUDF
+from libertem.api import Context
 
 from utils import _mk_random, ValidationUDF
 
@@ -589,7 +592,7 @@ class ReshapedViewUDF(UDF):
 def test_noncontiguous_tiles(lt_ctx, backend):
     if backend == 'cupy':
         d = detect()
-        cudas = detect()['cudas']
+        cudas = d['cudas']
         if not d['cudas'] or not d['has_cupy']:
             pytest.skip("No CUDA device or no CuPy, skipping CuPy test")
 
@@ -600,7 +603,10 @@ def test_noncontiguous_tiles(lt_ctx, backend):
     )
     try:
         if backend == 'cupy':
-            set_use_cuda(cudas[0])
+            gpu_id = cudas[0]
+            set_use_cuda(gpu_id)
+        else:
+            gpu_id = None
         udf = ReshapedViewUDF()
         res = lt_ctx.run_udf(udf=udf, dataset=dataset)
         partition = next(dataset.get_partitions())
@@ -619,14 +625,13 @@ def test_noncontiguous_tiles(lt_ctx, backend):
         UDFPartRunner([p_udf], debug=True).run_for_partition(
             partition=partition,
             params=params,
-            env=Environment(threads_per_worker=1, threaded_executor=False),
+            env=Environment(threads_per_worker=1, threaded_executor=False, gpu_id=gpu_id),
             backend_choice=BACKENDS,
         )
 
+        assert np.all(res["sigbuf"].data == 1)
     finally:
         set_use_cpu(0)
-
-    assert np.all(res["sigbuf"].data == 1)
 
 
 class CheckSigSlice(UDF):
@@ -708,7 +713,7 @@ class CheckSigSliceFrame(UDF):
 def test_sig_slice(lt_ctx, backend, udf_class, tileshape, success):
     if backend == 'cupy':
         d = detect()
-        cudas = detect()['cudas']
+        cudas = d['cudas']
         if not d['cudas'] or not d['has_cupy']:
             pytest.skip("No CUDA device or no CuPy, skipping CuPy test")
 
@@ -770,3 +775,120 @@ def test_previous_attrs(lt_ctx, cls):
     # the current alternative
     with pytest.raises(AttributeError, match='self.meta.'):
         lt_ctx.run_udf(dataset=ds, udf=cls())
+
+
+class BadGetMethodUDF(UDF):
+    def get_result_buffers(self):
+        return {}
+
+    def get_method(self):
+        return self.params.get('method', 42)
+
+
+@pytest.mark.parametrize(
+    'method',
+    [
+        42,
+        UDFMethod.FRAME,
+        UDFMethod.PARTITION,
+        UDFMethod.TILE,
+    ]
+)
+def test_bad_custom_get_method(lt_ctx, method):
+    # UDF implements no methods, so even if get_method()
+    # returns a valid member of the enum the UDF interface
+    # should raise the exception somewhere during initialization
+    # also checks that the invalid return '42' causes the raise
+    ds = lt_ctx.load('memory', data=np.ones((2, 2, 4, 4)))
+    with pytest.raises(UDFException):
+        lt_ctx.run_udf(dataset=ds, udf=BadGetMethodUDF(method=method))
+
+
+class NoImplemUDF(UDF):
+    ...
+
+
+def test_no_implementation_default_raises():
+    # Checks the default get_method() raises when no method is implemented
+    with pytest.raises(TypeError):
+        NoImplemUDF().get_method()
+
+
+class MultiImplemUDF(UDF):
+    def get_result_buffers(self):
+        return {'val': self.buffer(kind='nav', dtype=int)}
+
+    def process_tile(self, tile):
+        self.results.val[:] = 42
+
+    def process_frame(self, frame):
+        self.results.val[:] = 53
+
+    def process_partition(self, partition):
+        self.results.val[:] = 64
+
+    def get_method(self):
+        if self.params.method == 'frame':
+            return UDF.UDF_METHOD.FRAME
+        elif self.params.method == 'partition':
+            return UDF.UDF_METHOD.PARTITION
+        else:
+            return UDF.UDF_METHOD.TILE
+
+
+def test_multi_implem(lt_ctx):
+    ds = lt_ctx.load('memory', data=np.ones((2, 2, 4, 4)))
+    method = None
+    res = lt_ctx.run_udf(dataset=ds, udf=MultiImplemUDF(method=method))
+    assert (res['val'].data == 42).all()
+    method = 'frame'
+    res = lt_ctx.run_udf(dataset=ds, udf=MultiImplemUDF(method=method))
+    assert (res['val'].data == 53).all()
+    method = 'partition'
+    res = lt_ctx.run_udf(dataset=ds, udf=MultiImplemUDF(method=method))
+    assert (res['val'].data == 64).all()
+
+
+def test_copy_roi(lt_ctx):
+    ds = lt_ctx.load('memory', data=np.ones((2, 2, 4, 4)))
+    roi = ds.roi[0, 0]
+    res = lt_ctx.run_udf(dataset=ds, udf=SumSigUDF(), roi=roi)
+    assert res['intensity']._roi.sum() == 1
+    roi[:] = ds.roi[:, :]
+    assert res['intensity']._roi.sum() == 1
+
+
+class GetResultsCalledError(Exception):
+    pass
+
+
+class GetResultsNotCalledUDF(UDF):
+    def get_result_buffers(self):
+        return {}
+
+    def process_frame(self, frame):
+        pass
+
+    def get_results(self):
+        raise GetResultsCalledError("should not be called")
+
+
+def test_lazy_get_results_not_called(lt_ctx: Context, default_raw):
+    results = lt_ctx.run_udf_iter(
+        dataset=default_raw,
+        udf=GetResultsNotCalledUDF()
+    )
+
+    for res in results:
+        pass
+        # if we accessed `res.buffers`, `get_results` would be called and the
+        # `RuntimeError` would be thrown; see below:
+
+    results = lt_ctx.run_udf_iter(
+        dataset=default_raw,
+        udf=GetResultsNotCalledUDF()
+    )
+
+    with pytest.raises(GetResultsCalledError):
+        for res in results:
+            res.buffers

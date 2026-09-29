@@ -1,2 +1,2 @@
 #!/bin/bash
-pip-compile --no-emit-index-url ../../setup.py -Uo requirements.txt
+uv pip compile --no-emit-index-url ../../pyproject.toml -Uo requirements.txt

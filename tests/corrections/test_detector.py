@@ -383,11 +383,11 @@ def test_mask_correction_sparse():
         print("Sig dims:", sig_dims)
         print("Exclude: ", exclude)
 
-        masks = sparse.DOK(sparse.zeros((20, ) + sig_dims, dtype=np.float64))
-        indices = [np.random.randint(low=0, high=s, size=s//2) for s in (20, ) + sig_dims]
-        for tup in zip(*indices):
-            masks[tup] = 1
-        masks = masks.to_coo()
+        shape = (20, ) + sig_dims
+        count = min(shape)//2
+        assert count > 0
+        indices = np.stack([np.random.randint(low=0, high=s, size=count) for s in shape], axis=0)
+        masks = sparse.COO(coords=indices, shape=shape, data=1).astype(np.float64)
 
         data_flat = data.reshape((np.prod(nav_dims), np.prod(sig_dims)))
         damaged_flat = damaged_data.reshape((np.prod(nav_dims), np.prod(sig_dims)))
@@ -481,11 +481,11 @@ def test_mask_patch_sparse():
         print("Sig dims:", sig_dims)
         print("Exclude: ", exclude)
 
-        masks = sparse.DOK(sparse.zeros((20, ) + sig_dims, dtype=np.float64))
-        indices = [np.random.randint(low=0, high=s, size=s//2) for s in (20, ) + sig_dims]
-        for tup in zip(*indices):
-            masks[tup] = 1
-        masks = masks.to_coo()
+        shape = (20, ) + sig_dims
+        count = min(shape)//2
+        assert count > 0
+        indices = np.stack([np.random.randint(low=0, high=s, size=count) for s in shape], axis=0)
+        masks = sparse.COO(coords=indices, shape=shape, data=1).astype(np.float64)
 
         data_flat = data.reshape((np.prod(nav_dims), np.prod(sig_dims)))
         damaged_flat = damaged_data.reshape((np.prod(nav_dims), np.prod(sig_dims)))
@@ -553,3 +553,17 @@ def test_mask_patch_overlapping():
             data=correct_dot, corrected=reconstructed_dot,
             atol=1e-8, rtol=1e-5
         )
+
+
+def test_f_order_correct():
+    img = np.zeros((128, 128), dtype=np.float32, order='F')
+    with pytest.raises(detector.CorrectError):
+        detector.correct(buffer=img, sig_shape=img.shape)
+
+
+def test_non_contiguous_correct():
+    img = np.zeros((2, 128, 128), dtype=np.float32)
+    img = img[:, :64, :64]
+    assert not img.flags.c_contiguous
+    with pytest.raises(detector.CorrectError):
+        detector.correct(buffer=img, sig_shape=img.shape, inplace=True)

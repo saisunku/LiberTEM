@@ -1,5 +1,3 @@
-from typing import Optional
-
 from sparseconverter import ArrayBackend, NUMPY, for_backend
 import dask
 import dask.array
@@ -22,9 +20,24 @@ def _get_tile_converted(p, dest_dtype, roi, array_backend):
 
 
 def make_dask_array(dataset: DataSet, dtype='float32', roi=None,
-        array_backend: Optional[ArrayBackend] = None):
+        array_backend: ArrayBackend | None = None):
     '''
     Create a Dask array using the DataSet's partitions as blocks.
+
+    Parameters
+    ----------
+
+    dataset
+        The LiberTEM dataset to load from
+
+    dtype
+        The numpy dtype into which the data should be converted
+
+    roi
+        Restrict the dataset to this region of interest (nav-shaped mask)
+
+    array_backend
+        The array type the data should be converted to
     '''
     chunks = []
     workers = {}

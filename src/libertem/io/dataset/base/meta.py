@@ -1,4 +1,5 @@
-from typing import Any, Optional, TYPE_CHECKING, Sequence
+from typing import Any, TYPE_CHECKING
+from collections.abc import Sequence
 
 import jsonschema
 import numpy as np
@@ -15,7 +16,7 @@ class DataSetMeta:
     shape
         "native" dataset shape, can have any dimensionality
 
-    array_backends: Optional[Sequence[ArrayBackend]]
+    array_backends: Sequence[ArrayBackend] | None
 
     raw_dtype : np.dtype
         dtype used internally in the data set for reading
@@ -38,11 +39,11 @@ class DataSetMeta:
     def __init__(
         self,
         shape: Shape,
-        array_backends: Optional[Sequence[ArrayBackend]] = None,
+        array_backends: Sequence[ArrayBackend] | None = None,
         image_count: int = 0,
-        raw_dtype: "Optional[nt.DTypeLike]" = None,
-        dtype: "Optional[nt.DTypeLike]" = None,
-        metadata: Optional[Any] = None,
+        raw_dtype: "nt.DTypeLike | None" = None,
+        dtype: "nt.DTypeLike | None" = None,
+        metadata: Any | None = None,
         sync_offset: int = 0
     ):
         self.shape = shape
@@ -70,7 +71,7 @@ class PartitionStructure:
     Parameters
     ----------
 
-    slices : List[Tuple[Int]]
+    slices : List[Tuple[Int, ...]]
         List of tuples [start_idx, end_idx) that partition the data set by the flattened
         navigation axis
 

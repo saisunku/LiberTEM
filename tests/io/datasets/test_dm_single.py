@@ -11,6 +11,7 @@ from libertem.io.dataset.base.tiling_scheme import TilingScheme
 from libertem.udf.base import UDF
 from libertem.udf.sumsigudf import SumSigUDF
 from libertem.io.dataset.dm_single import SingleDMDataSet
+from libertem.contrib.convert_transposed import convert_dm4_transposed
 
 try:
     import hyperspy.api as hs
@@ -275,8 +276,7 @@ def test_many_tiles(monkeypatch, dm4_mockfile_c, lt_ctx_fast):
     (array, filename), mock_fileDM = dm4_mockfile_c
     _patch_filedm(monkeypatch, mock_fileDM)
 
-    ds = lt_ctx_fast.load('dm', filename)
-    ds.set_num_cores(8)
+    ds = lt_ctx_fast.load('dm', filename, num_partitions=8)
     _, _, sy, sx = array.shape
     flat_data = array.reshape(-1, sy, sx)
     # depth 5, height 3, divides neither flat_nav or sy evenly
@@ -346,8 +346,7 @@ def test_macrotile_normal(monkeypatch, dm4_mockfile_c, lt_ctx_fast):
     (array, filename), mock_fileDM = dm4_mockfile_c
     _patch_filedm(monkeypatch, mock_fileDM)
 
-    ds = lt_ctx_fast.load('dm', filename)
-    ds.set_num_cores(4)
+    ds = lt_ctx_fast.load('dm', filename, num_partitions=4)
 
     ps = ds.get_partitions()
     _ = next(ps)
@@ -382,8 +381,8 @@ def test_positive_sync_offset(monkeypatch, dm4_mockfile_c, lt_ctx):
     ds_with_offset = SingleDMDataSet(
         path=filename,
         sync_offset=sync_offset,
+        num_partitions=4,
     )
-    ds_with_offset.set_num_cores(4)
     ds_with_offset = ds_with_offset.initialize(lt_ctx.executor)
     ds_with_offset.check_valid()
 
@@ -433,8 +432,8 @@ def test_negative_sync_offset(monkeypatch, dm4_mockfile_c, lt_ctx):
     ds_with_offset = SingleDMDataSet(
         path=filename,
         sync_offset=sync_offset,
+        num_partitions=4,
     )
-    ds_with_offset.set_num_cores(4)
     ds_with_offset = ds_with_offset.initialize(lt_ctx.executor)
     ds_with_offset.check_valid()
 
@@ -521,3 +520,44 @@ def test_sig_reshaping_c(monkeypatch, dm4_mockfile_c, lt_ctx_fast):
     partial_array = flat_array[:nel].reshape(array.shape[:2] + manual_sig_shape)
     partial_sum = partial_array.sum(axis=(2, 3))
     assert np.allclose(result_array, partial_sum)
+
+
+@pytest.mark.skipif(not HAVE_DM_TESTDATA, reason="No DM4 test data")
+def test_convert_not_transposed_raises(lt_ctx, dm4_c_order_4d_path):
+    with pytest.raises(DataSetException):
+        convert_dm4_transposed(
+            dm4_c_order_4d_path,
+            'out.npy',
+            ctx=lt_ctx,
+        )
+
+
+def test_convert_f_ordered(monkeypatch, dm4_mockfile_f, lt_ctx, tmpdir_factory):
+    tdir = tmpdir_factory.mktemp('convert_transposed')
+
+    # the mockfile array in memory is already c-ordered
+    (array, filename), mock_fileDM = dm4_mockfile_f
+    _patch_filedm(monkeypatch, mock_fileDM)
+
+    converted_path = os.path.join(tdir, 'out_dm4_f.npy')
+    convert_dm4_transposed(
+        filename,
+        converted_path,
+        ctx=lt_ctx,
+    )
+
+    ds_npy = lt_ctx.load('npy', path=converted_path)
+    pick_a = lt_ctx.create_pick_analysis(ds_npy, 4, 3)
+    pick_frame = lt_ctx.run(pick_a).intensity.raw_data
+    # flipped coords because pick_a takes x, y arguments
+    assert np.allclose(pick_frame, array[3, 4, :, :])
+
+
+@pytest.mark.skipif(not HAVE_DM_TESTDATA, reason="No DM4 test data")
+def test_num_partitions(lt_ctx, dm3_3dstack_path):
+    ds = lt_ctx.load(
+        "dm",
+        path=dm3_3dstack_path,
+        num_partitions=2,
+    )
+    assert len(list(ds.get_partitions())) == 2

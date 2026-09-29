@@ -1,12 +1,17 @@
 import numpy as np
 import numba
 import sparse
+import sparseconverter
 
 from libertem.common.math import prod
 from libertem.common.sparse import is_sparse
 from libertem.common.numba import (
     numba_ravel_multi_index_multi, numba_unravel_index_multi
 )
+
+
+class CorrectError(Exception):
+    pass
 
 
 @numba.njit(cache=True, nogil=True)
@@ -243,6 +248,22 @@ def correct(
         # astype() is always a copy even if it is the same dtype
         out = buffer.astype(np.result_type(np.float32, buffer))
 
+    # we need to check even if inplace=False because `astype` doesn't touch
+    # the array order:
+    if not out.flags['C_CONTIGUOUS'] or np.isfortran(buffer):
+        raise CorrectError(
+            "For in-place operation, the buffer given must be C-contiguous"
+        )
+
+    # With current numpy, we can enforce that no copy is happening. This is an
+    # extra safeguard in case the checks above don't catch the issue, but can
+    # not be done with old (<2.1) versions:
+    try:
+        # This will give a ValueError in case a reshape without copying is not possible:
+        out_reshaped = out.reshape((prod(nav_shape), prod(sig_shape)), copy=False)
+    except TypeError:
+        out_reshaped = out.reshape((prod(nav_shape), prod(sig_shape)))
+
     if repair_descriptor is None:
         repair_descriptor = RepairDescriptor(
             sig_shape=sig_shape,
@@ -255,7 +276,7 @@ def correct(
             raise ValueError("Invalid arguments: Bot repair_descriptor and excluded_pixels set")
 
     _correct_numba_inplace(
-        buffer=out.reshape((prod(nav_shape), prod(sig_shape))),
+        buffer=out_reshaped,
         dark_image=dark_image,
         gain_map=gain_map,
         exclude_pixels=repair_descriptor.exclude_flat,
@@ -310,7 +331,7 @@ def correct_dot_masks(masks, gain_map, excluded_pixels=None, allow_empty=False):
                 for rr in r[:c]:
                     result[m, rr] = result[m, rr] + rep[m]
         if is_sparse(result):
-            result = sparse.COO(result)
+            result = sparseconverter.for_backend(result, sparseconverter.SPARSE_COO)
     else:
         result = masks
     result = result * gain_map.flatten()

@@ -1,7 +1,7 @@
 import os
 import warnings
 import typing
-from typing import Dict, Any, Tuple, Optional
+from typing import Any
 import logging
 
 import ncempy.io.dm
@@ -9,7 +9,7 @@ import numpy as np
 
 from libertem.common.math import prod
 from libertem.common import Shape
-from .base import BasePartition, DataSetException, DataSetMeta, File, IOBackend
+from .base import BasePartition, DataSetException, DataSetMeta, File, IOBackend, DataSet
 from .dm import DMDataSet, SingleDMDatasetParams, DMFileSet
 
 log = logging.getLogger(__name__)
@@ -39,6 +39,9 @@ class SingleDMDataSet(DMDataSet):
     :code:`(flat_sig, flat_nav)` then the dataset will raise an exception
     unless the `force_c_order` argument. is set to true.
 
+    A converter for F/C-hybrid files is provided as
+    :meth:`~libertem.contrib.convert_transposed.convert_dm4_transposed`.
+
     Note
     ----
     In the Web-GUI a 2D-image or 3D-stack/spectrum image will have extra
@@ -56,12 +59,12 @@ class SingleDMDataSet(DMDataSet):
     path : PathLike
         The path to the .dm3/.dm4 file
 
-    nav_shape : Tuple[int], optional
+    nav_shape : Tuple[int, ...], optional
         Over-ride the nav_shape provided by the file metadata.
         This can be used to adjust the total
         number of frames.
 
-    sig_shape: Tuple[int], optional
+    sig_shape: Tuple[int, ...], optional
         Over-ride the sig_shape provided by the file metadata.
         Data are read sequentially in all cases, therefore this
         is typically only interesting if the total number of
@@ -86,18 +89,28 @@ class SingleDMDataSet(DMDataSet):
         the datasets in a DM-file often begin with a thumbnail
         which occupies the 0 dataset index. If not provided the
         first compatible dataset found in the file is used.
+
+    num_partitions: int, optional
+        Override the number of partitions. This is useful if the
+        default number of partitions, chosen based on common workloads,
+        creates partitions which are too large (or small) for the UDFs
+        being run on this dataset.
     """
     def __init__(
         self,
         path: os.PathLike,
-        nav_shape: Optional[Tuple[int, ...]] = None,
-        sig_shape: Optional[Tuple[int, ...]] = None,
+        nav_shape: tuple[int, ...] | None = None,
+        sig_shape: tuple[int, ...] | None = None,
         sync_offset: int = 0,
-        io_backend: Optional[IOBackend] = None,
+        io_backend: IOBackend | None = None,
         force_c_order: bool = False,
-        dataset_index: Optional[int] = None
+        dataset_index: int | None = None,
+        num_partitions: int | None = None,
     ):
-        super().__init__(io_backend=io_backend)
+        super().__init__(
+            io_backend=io_backend,
+            num_partitions=num_partitions,
+        )
         self._filesize = None
 
         self._path = path
@@ -106,6 +119,21 @@ class SingleDMDataSet(DMDataSet):
         self._sync_offset = sync_offset
         self._force_c_order = force_c_order
         self._dm_ds_index = dataset_index
+
+    def __new__(cls, *args, **kwargs):
+        '''
+        Skip the superclasse's :code:`__new__()` method.
+
+        Instead, go straight to the grandparent. That disables the
+        :class:`DMDataSet` type determination magic. Otherwise unpickling will
+        always yield a :class:`SingleDMDataSet` since this class inherits the
+        parent's :code:`__new__()` method and unpickling calls it without
+        parameters, making it select :class:`SingleDMDataSet`.
+
+        It mimics calling the superclass :code:`__new__(cls)` without additional
+        parameters, just like the parent's method.
+        '''
+        return DataSet.__new__(cls)
 
     def __repr__(self):
         try:
@@ -260,7 +288,7 @@ class SingleDMDataSet(DMDataSet):
         return array_meta
 
     @staticmethod
-    def _tags_to_nest(tags: Dict[str, Any]):
+    def _tags_to_nest(tags: dict[str, Any]):
         tags_nest = {}
         for tag, element in tags.items():
             tag = tag.strip('.')
@@ -275,7 +303,7 @@ class SingleDMDataSet(DMDataSet):
         return tags_nest
 
     @staticmethod
-    def _modify_shape(shape: Tuple[int], sig_dims: int = 2):
+    def _modify_shape(shape: tuple[int, ...], sig_dims: int = 2):
         # The shape reversal to read in C-ordering applies to DM4/STEM files
         # saved in the new style as well as DM3, 3D image stacks saved
         # in older versions of GMS. Must check whether newer image stacks

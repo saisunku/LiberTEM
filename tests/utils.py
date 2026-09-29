@@ -11,7 +11,6 @@ from sparseconverter import (
     DENSE_BACKENDS, ND_BACKENDS, NUMPY, SPARSE_BACKENDS, SPARSE_GCXS, ArrayBackend, for_backend
 )
 from libertem.common.sparse import to_dense
-from libertem.analysis.gridmatching import calc_coords
 from libertem.udf import UDF
 import libertem.common.backend as bae
 from libertem.udf.raw import PickUDF
@@ -48,7 +47,7 @@ def _naive_mask_apply(masks, data):
 
 # This function introduces asymmetries so that errors won't average out so
 # easily with large data sets
-def _mk_random(size, dtype='float32', array_backend=NUMPY):
+def _mk_random(size, dtype='float32', array_backend=NUMPY, sparse_density=None):
     size = tuple(size)
     if array_backend not in ND_BACKENDS and len(size) != 2:
         raise ValueError(f"Format {array_backend} does not support size {size}")
@@ -58,7 +57,12 @@ def _mk_random(size, dtype='float32', array_backend=NUMPY):
             form = 'gcxs'
         else:
             form = 'coo'
-        data = for_backend(sparse.random(size, format=form).astype(dtype), array_backend)
+        data = for_backend(
+            sparse.random(
+                size, format=form, density=sparse_density,
+            ).astype(dtype),
+            array_backend,
+        )
     elif array_backend in DENSE_BACKENDS:
         if dtype.kind == 'c':
             choice = [0, 1, -1, 0+1j, 0-1j, 2.3+17j, -23+42j]
@@ -82,19 +86,10 @@ def _mk_random(size, dtype='float32', array_backend=NUMPY):
     return data
 
 
-def _fullgrid(zero, a, b, index, skip_zero=False):
-    i, j = np.mgrid[-index:index, -index:index]
-    indices = np.concatenate(np.array((i, j)).T)
-    if skip_zero:
-        select = (np.not_equal(indices[:, 0], 0) + np.not_equal(indices[:, 1], 0))
-        indices = indices[select]
-    return calc_coords(zero, a, b, indices)
-
-
 def assert_msg(msg, msg_type, status='ok'):
     print(time.time(), datetime.datetime.now(), msg, msg_type, status)
     assert msg['status'] == status
-    assert msg['messageType'] == msg_type,\
+    assert msg['messageType'] == msg_type, \
         "expected: {}, is: {}".format(msg_type, msg['messageType'])
 
 
@@ -279,7 +274,7 @@ def dataset_correction_verification(ds, roi, lt_ctx, exclude=None):
                 for s in tuple(ds.shape.sig)
             ]
 
-        exclude_coo = sparse.COO(coords=exclude, data=True, shape=ds.shape.sig)
+        exclude_coo = sparse.COO(coords=np.array(exclude), data=True, shape=ds.shape.sig)
         corrset = CorrectionSet(dark=dark, gain=gain, excluded_pixels=exclude_coo)
 
         # This one uses native input data
@@ -361,6 +356,13 @@ def get_testdata_path():
         os.path.normpath(
             os.path.join(os.path.dirname(__file__), '..', 'data')
         )
+    )
+
+
+def get_tmpdata_path():
+    return os.environ.get(
+        'TMP_TESTDATA_PATH',
+        os.path.join(get_testdata_path(), 'temp_data')
     )
 
 

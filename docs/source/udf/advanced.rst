@@ -117,14 +117,22 @@ per-partition processing for an UDF.
 Precedence
 ----------
 
-The UDF interface looks for methods in the order
+By default the UDF interface looks for methods in the order
 :meth:`~libertem.udf.base.UDFTileMixin.process_tile`,
 :meth:`~libertem.udf.base.UDFFrameMixin.process_frame`,
-:meth:`~libertem.udf.base.UDFPartitionMixin.process_partition`. For now, the first in
-that order is executed. In the future, composition of UDFs may allow to use
-different methods depending on the circumstances.
-:meth:`~libertem.udf.base.UDFTileMixin.process_tile` is the most general method and
-allows by-frame and by-partition processing as well.
+:meth:`~libertem.udf.base.UDFPartitionMixin.process_partition` and will use the first
+matching implementation. :meth:`~libertem.udf.base.UDFTileMixin.process_tile` is
+the most general method and should allow by-frame and by-partition processing as well.
+
+If a UDF requires more than one implementation depending on how it is
+parametrised or the data it is supplied with, the :meth:`~libertem.udf.base.UDF.get_method`
+method can be overridden to influence how the UDF will be run. This method must
+return a member of the :attr:`libertem.udf.base.UDF.UDF_METHOD` enum and have
+the corresponding processing method implemented.
+
+.. versionchanged:: 0.13.0
+    :meth:`~libertem.udf.base.UDF.get_method()` was exposed to enable
+    choice of processing method at runtime
 
 Post-processing of partition results
 ------------------------------------
@@ -179,7 +187,7 @@ Post-processing after merging
 
 If you want to implement a post-processing step that is run on the main node
 after merging result buffers, you can override
-:meth:`libertem.udf.base.UDF.get_results`:
+:meth:`~libertem.udf.base.UDF.get_results`:
 
 .. testsetup::
 
@@ -214,22 +222,27 @@ after merging result buffers, you can override
 
     ctx.run_udf(dataset=dataset, udf=AverageUDF())
 
-Note that :meth:`UDF.get_result_buffers` returns a placeholder entry for the
+Note that :meth:`~libertem.udf.base.UDF.get_result_buffers` returns a placeholder entry for the
 :code:`average` result using :code:`use='result_only'`, which is then filled in
-:code:`get_results`.  We don't need to repeat those buffers that should be
+:meth:`~libertem.udf.base.UDF.get_results`.  We don't need to repeat those buffers that should be
 returned unchanged; if you want to omit a buffer from the results completely,
 you can declare it as private with :code:`self.buffer(..., use='private')` in
-:code:`get_result_buffers`.
+:meth:`~libertem.udf.base.UDF.get_result_buffers`.
 
-:meth:`UDF.get_results` should return the results as a dictionary of numpy
+:meth:`~libertem.udf.base.UDF.get_results` should return the results as a dictionary of numpy
 arrays, with the keys matching those returned by
-:meth:`UDF.get_result_buffers`.
+:meth:`~libertem.udf.base.UDF.get_result_buffers`.
 
-When returned from :meth:`Context.run_udf`, all results are wrapped into
-:code:`BufferWrapper` instances. This is done primarily to get convenient
-access to a version of the result that is suitable for visualization, even if
+When returned from :meth:`~libertem.api.Context.run_udf`, all results are wrapped into
+:class:`~libertem.common.buffers.BufferWrapper` instances. This is done primarily to get convenient
+access to a version of the result that is suitable for visualization using
+:attr:`~libertem.common.buffers.BufferWrapper.data`, even if
 a :code:`roi` was used, but still allow access to the raw result using
-:attr:`BufferWrapper.raw_data` attribute.
+:attr:`~libertem.common.buffers.BufferWrapper.raw_data` attribute.
+
+Implementations of :meth:`~libertem.udf.base.UDF.get_results` should not
+have side-effects you rely on, as in some situations, it will be called lazily,
+i.e. only when accessing the :code:`buffers` attribute of the results object.
 
 The detailed rules for buffer declarations, :code:`get_result_buffers` and :code:`get_results` are:
 
@@ -266,6 +279,129 @@ by the ROI.
     :meth:`libertem.udf.base.UDFPreprocessMixin.preprocess` is executed on the main
     node, too. Views for aux data are set correctly on the main node. Previously,
     it was only executed on the worker nodes.
+
+.. _`udf valid data masking`:
+
+Valid data masking
+------------------
+
+In various intermediate states, result buffers may be only partially filled
+with valid data. This comes from the fact that we split the dataset into
+partitions and then merge results together only as they become available.
+When doing live processing we also have the constraint that not all frames
+have been acquired yet, and so naturally only positions where we have
+received and processed data can be valid in the corresponding result buffer.
+
+Handling partially valid data becomes important when running the UDF. For example,
+live plotting needs to know what regions of the results to include. Also, when using
+:meth:`~libertem.api.Context.run_udf_iter` you might only want to handle the already valid
+parts of the results.
+
+For UDF results, you can access
+:attr:`~libertem.common.buffers.BufferWrapper.valid_mask` to access
+the valid mask for that particular buffer. You can also use
+:attr:`~libertem.common.buffers.BufferWrapper.masked_data` 
+to access the data of the buffer as a numpy masked array.
+
+For example:
+
+.. testsetup::
+
+    from libertem.udf.sumsigudf import SumSigUDF
+
+.. testcode::
+
+    # use `run_udf_iter` to get partial results while the computation is running:
+    for res in ctx.run_udf_iter(dataset=dataset, udf=SumSigUDF()):
+
+        # get the BufferWrapper for the 'intensity' buffer of the first UDF:
+        buf = res.buffers[0]['intensity']
+
+        # boolean mask that contains True for valid elements:
+        mask = buf.valid_mask
+
+        # get a numpy masked array that is limited to the valid elements:
+        masked_data = buf.masked_data
+
+
+By default, the valid masks of results depend on the buffer kind:
+
+=================== ==================
+Buffer :code:`kind` Default valid mask
+=================== ==================
+:code:`'single'`    All-valid
+------------------- ------------------
+:code:`'sig'`       All-valid
+------------------- ------------------
+:code:`'nav'`       Parts which have been merged using :meth:`~libertem.udf.UDF.merge`
+=================== ==================
+
+In your UDF, you can also customize the valid mask that should be returned.
+This is useful if the dataset might contain invalid frames discovered at runtime,
+or if intermediate results cannot be fully valid due to missing information (e.g.
+calculating gradients across partition boundaries). Another example is when using
+a :code:`kind='single'` buffer which is progressively computed; valid-by-default
+might be incorrect if not enough information has been seen (e.g. statistical measures
+or a count of values).
+
+Customizing the valid data mask is done in :meth:`~libertem.udf.UDF.get_results`
+with the :meth:`~libertem.udf.UDF.with_mask` method. For example:
+
+.. testsetup::
+
+    from libertem.udf import UDF
+    from libertem.common.math import count_nonzero    
+
+
+.. testcode::
+
+    class CustomValidMask(UDF):
+        def get_result_buffers(self):
+            nav_shape = self.meta.dataset_shape.nav
+
+            if self.meta.roi is not None:
+                nav_shape = (count_nonzero(self.meta.roi),)
+
+            return {
+                # Emulate a kind='nav' result buffer using a kind='sig' buffer for demonstration.
+                # In the real world, such result buffers can be found in the implementations of ptychography
+                # and iCoM since they reconstruct the object in Fourier space
+                'custom_2d': self.buffer(kind='single', dtype=np.float32, extra_shape=nav_shape),
+            }
+
+        def process_frame(self, frame):
+            self.results.custom_2d[self.meta.coordinates] = np.sum(frame)
+
+        def get_results(self):
+            # in this case, we set the valid mask of the kind=single buffer to
+            # match what a nav buffer would do.
+            valid_nav_mask = self.meta.get_valid_nav_mask()
+
+            return {
+                'custom_2d': self.with_mask(
+                    self.results.custom_2d,
+                    mask=valid_nav_mask.reshape(self.results.custom_2d.shape)
+                ),
+            }
+
+        def merge(self, dest, src):
+            dest.custom_2d += src.custom_2d
+
+
+    ctx.run_udf(dataset=dataset, udf=CustomValidMask())
+
+This example also shows the :meth:`~libertem.udf.base.UDFMeta.get_valid_nav_mask`
+method, which is available in :meth:`~libertem.udf.UDF.merge` and
+:meth:`~libertem.udf.UDF.get_results`, and gives you a mask of the
+already-processed navigation elements.
+
+.. versionadded:: 0.14.0
+    
+   In previous versions, only :attr:`libertem.udf.base.UDFResults.damage` was
+   available for inspecting the mask of already processed data.
+   This did not account for differences between buffers, and was only available
+   when iterating over results, i.e. with :meth:`~libertem.api.Context.run_udf_iter`.
+
 
 AUX data
 --------
@@ -546,6 +682,12 @@ is useful for running code that uses CUDA in a different way, for example
 integration of C++ CUDA code, and allows to skip installation of CuPy in this
 situation.
 
+.. note::
+
+    At this time, using CUDA without CuPy is not actively used within LiberTEM,
+    so this is not well-tested and may need adjustments in practice. Using CUDA
+    through CuPy is the common case.
+
 The :attr:`libertem.udf.base.UDF.xp` property points to the :code:`numpy` or
 :code:`cupy` module, depending which back-end is currently used. By using
 :code:`self.xp` instead of the usual :code:`np` for NumPy, one can write UDFs
@@ -589,11 +731,45 @@ device class so that :ref:`udf cuda` works analogously for both dense and sparse
 formats. Dense CPU and GPU arrays are specified with the backends described in
 :ref:`udf cuda` so that the extension to sparse arrays is backwards-compatible.
 
-The possible backends supported by LiberTEM are available as the
-:code:`BACKEND_*` constants in :class:`libertem.udf.base.UDF`. Some array backends only
-support 2D matrices. The frame, tile or partition is supplied
-with flattened signal dimensions for these. Furthermore, frames include a nav dimension of
-1 with such 2D-only formats.
+The possible backends supported by LiberTEM are available as the following
+constants: :attr:`libertem.udf.base.UDF.BACKEND_NUMPY`,
+:attr:`~libertem.udf.base.UDF.BACKEND_CUPY`,
+:attr:`~libertem.udf.base.UDF.BACKEND_CUDA`,
+:attr:`~libertem.udf.base.UDF.BACKEND_SPARSE_COO`,
+:attr:`~libertem.udf.base.UDF.BACKEND_SPARSE_GCXS`,
+:attr:`~libertem.udf.base.UDF.BACKEND_SPARSE_DOK`,
+:attr:`~libertem.udf.base.UDF.BACKEND_SCIPY_COO`,
+:attr:`~libertem.udf.base.UDF.BACKEND_SCIPY_CSR`,
+:attr:`~libertem.udf.base.UDF.BACKEND_SCIPY_CSC`,
+:attr:`~libertem.udf.base.UDF.BACKEND_SCIPY_COO_ARRAY`,
+:attr:`~libertem.udf.base.UDF.BACKEND_SCIPY_CSR_ARRAY`,
+:attr:`~libertem.udf.base.UDF.BACKEND_SCIPY_CSC_ARRAY`,
+:attr:`~libertem.udf.base.UDF.BACKEND_CUPY_SCIPY_COO`,
+:attr:`~libertem.udf.base.UDF.BACKEND_CUPY_SCIPY_CSR`,
+:attr:`~libertem.udf.base.UDF.BACKEND_CUPY_SCIPY_CSC`.
+
+:attr:`~libertem.udf.base.UDF.BACKEND_ALL` is a tuple of all backends that are
+recommended for use in UDFs.
+
+.. versionadded:: 0.12.0
+    The sets :attr:`~libertem.udf.base.UDF.CPU_BACKENDS`,
+    :attr:`~libertem.udf.base.UDF.CUDA_BACKENDS`, and
+    :attr:`~libertem.udf.base.UDF.CUPY_BACKENDS` categorize backends by device class.
+    :attr:`~libertem.udf.base.UDF.SPARSE_BACKENDS` and
+    :attr:`~libertem.udf.base.UDF.DENSE_BACKENDS` categorize between dense and
+    sparse arrays.
+    The backends in :attr:`~libertem.udf.base.UDF.D2_BACKENDS` only support 2D
+    matrices, while the ones in :attr:`~libertem.udf.base.UDF.ND_BACKENDS` support
+    n-dimensional arrays.
+
+.. versionadded:: 0.15.0
+    :attr:`~libertem.udf.base.UDF.BACKEND_SCIPY_COO_ARRAY`,
+    :attr:`~libertem.udf.base.UDF.BACKEND_SCIPY_CSR_ARRAY`, and
+    :attr:`~libertem.udf.base.UDF.BACKEND_SCIPY_CSC_ARRAY` are added.
+
+The frame, tile or partition is supplied with flattened
+signal dimensions for 2D-only backends. Furthermore, frames include a nav
+dimension of 1 with these backends.
 
 The backend that is used for a partition is available through
 :attr:`libertem.udf.base.UDF.meta.array_backend` at runtime. Please note that it can be
@@ -623,9 +799,11 @@ demonstrates how support for all array formats can be implemented:
 
     class SumSigUDF(UDF):
         def get_backends(self):
-            # Support all recommended array backends
+            # Support all recommended array backends in LiberTEM.
             # Please note that their APIs can differ so that comprehensive
-            # tests with all supported backends are required
+            # tests with all supported backends are required. Also, the list of
+            # supported backends in LiberTEM may grow in the future, which can
+            # require adaptations in an UDF that uses this constant.
             return self.BACKEND_ALL
 
         def get_result_buffers(self):
@@ -846,3 +1024,71 @@ The return value from :code:`merge_all` must be a dictionary of merged result ar
 with the keys matching the declared result buffers. There is, however, no requirement
 to return merged results for all existing buffers, though any that are missing will not
 contain results from the computation and are likely to be filled with zeros.
+
+Dynamically updating UDF parameters
+-----------------------------------
+
+.. versionadded:: 0.12.0
+
+    This is an experimental API, which we make explicit by naming
+    the method :code:`update_parameters_experimental`. It is not
+    guaranteed to work with all UDFs.
+
+Running UDFs in a feedback loop, for example on a live data stream using
+LiberTEM-live, is not only helpful for adjusting microscope parameters on the
+fly to match the reconstruction, but also for adjusting and fine tuning UDF
+parameters. Usually, this would be implemented like this:
+
+
+.. code-block:: python
+
+    while True:
+        udf = YourUDF(**get_new_parameters())
+        ctx.run_udf(dataset=ds, udf=udf, plots=True)
+
+
+This works, but limits the feedback loop to update once per complete run,
+which can be annoying especially for longer dwell times.
+
+Instead, the feedback loop can be shortened by updating parameters as soon as
+the first results are available. This is accomplished by using
+:meth:`~libertem.api.Context.run_udf_iter` instead of
+:meth:`~libertem.api.Context.run_udf`, and calling the
+:meth:`~libertem.api.ResultGenerator.update_parameters_experimental` method:
+
+.. code-block:: python
+
+    udf = YourUDF(**parameters)
+    while True:
+        result_iter = ctx.run_udf_iter(dataset=ds, udf=[udf])
+        for part_res in result_iter:
+            result_iter.update_parameters_experimental([
+                {'some_parameter': get_new_value()},
+            ])
+
+
+Note that this works when passing multiple UDFs into
+:meth:`~libertem.api.Context.run_udf_iter` as a list -
+we need to pass a :code:`dict` for each of them into
+:meth:`~libertem.api.ResultGenerator.update_parameters_experimental`.
+The :code:`dict` only needs to contain items for the parameters you want to update,
+and can be an empty :code:`dict` if you don't want to update any parameters
+for the corresponding UDF.
+
+The call to :code:`get_new_value` here can be any mechanism to get an updated
+value, be it querying a graphical user interface, or automatically calculating
+a new value based on the latest result from the UDFs.
+
+
+.. note::
+
+    This API is implemented for the following executor types: :code:`'inline'`,
+    :code:`'dask'`, :code:`'pipelined'`, and :code:`'threads'`, as specified
+    in :func:`~libertem.api.Context.make_with`. Meaning that if you don't
+    specify an executor, with either :class:`~libertem.api.Context` or
+    :class:`~libertem_live.api.LiveContext` from LiberTEM-live, it should just
+    work.
+
+    Note also that different executors schedule tasks differently, so especially
+    in the offline case, there may be a bit more latency before the new values for
+    parameters are available in the UDFs.

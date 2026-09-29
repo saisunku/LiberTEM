@@ -4,7 +4,6 @@ import threading
 import itertools
 from unittest import mock
 import sys
-from typing import Optional, Tuple
 
 import cloudpickle
 import numpy as np
@@ -340,7 +339,7 @@ def test_timeout_1(hdf5, lt_ctx):
 
 def test_timeout_2(hdf5, lt_ctx):
     print(threading.enumerate())
-    with mock.patch('libertem.io.dataset.hdf5.current_time', side_effect=[1, 30]):
+    with mock.patch('libertem.io.dataset.hdf5.current_time', side_effect=[1, 60]):
         params = H5DataSet.detect_params(hdf5.filename, executor=lt_ctx.executor)["parameters"]
         assert list(params.keys()) == ["path"]
 
@@ -350,7 +349,7 @@ def test_timeout_2(hdf5, lt_ctx):
     ds = ds.initialize(lt_ctx.executor)
 
     print(threading.enumerate())
-    with mock.patch('libertem.io.dataset.hdf5.current_time', side_effect=[30, 60]):
+    with mock.patch('libertem.io.dataset.hdf5.current_time', side_effect=[30, 90]):
         diags = ds.diagnostics
         print(diags)
 
@@ -715,9 +714,9 @@ def test_hdf5_filters(local_cluster_ctx, lt_ctx, tmpdir_factory):
 
 def _place_results(
     data: np.ndarray,
-    nav_shape: Tuple[int],
+    nav_shape: tuple[int],
     sync_offset: int = 0,
-    roi: Optional[np.ndarray] = None
+    roi: np.ndarray | None = None
 ) -> np.ndarray:
     """
     Places ravelled data into an array of nav_shape

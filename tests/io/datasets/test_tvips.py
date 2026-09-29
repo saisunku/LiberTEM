@@ -76,8 +76,8 @@ def default_tvips(lt_ctx):
         path=TVIPS_TESTDATA_PATH,
         nav_shape=nav_shape,
         io_backend=MMapBackend(),
+        num_partitions=4,
     )
-    ds.set_num_cores(4)
     return ds
 
 
@@ -142,9 +142,9 @@ def test_positive_sync_offset(default_tvips, lt_ctx):
     sync_offset = 2
 
     ds_with_offset = TVIPSDataSet(
-        path=TVIPS_TESTDATA_PATH, sync_offset=sync_offset
+        path=TVIPS_TESTDATA_PATH, sync_offset=sync_offset,
+        num_partitions=2,
     )
-    ds_with_offset.set_num_cores(2)
     ds_with_offset = ds_with_offset.initialize(lt_ctx.executor)
     ds_with_offset.check_valid()
 
@@ -161,8 +161,11 @@ def test_positive_sync_offset(default_tvips, lt_ctx):
         dataset_shape=ds_with_offset.shape,
     )
 
-    t0 = next(p0.get_tiles(tiling_scheme))
+    tiles = p0.get_tiles(tiling_scheme)
+    t0 = next(tiles)
     assert tuple(t0.tile_slice.origin) == (0, 0, 0)
+    for _ in tiles:
+        pass
 
     for p in ds_with_offset.get_partitions():
         for t in p.get_tiles(tiling_scheme=tiling_scheme):
@@ -188,9 +191,9 @@ def test_negative_sync_offset(default_tvips, lt_ctx):
     sync_offset = -2
 
     ds_with_offset = TVIPSDataSet(
-        path=TVIPS_TESTDATA_PATH, sync_offset=sync_offset
+        path=TVIPS_TESTDATA_PATH, sync_offset=sync_offset,
+        num_partitions=2,
     )
-    ds_with_offset.set_num_cores(2)
     ds_with_offset = ds_with_offset.initialize(lt_ctx.executor)
     ds_with_offset.check_valid()
 
@@ -207,8 +210,11 @@ def test_negative_sync_offset(default_tvips, lt_ctx):
         dataset_shape=ds_with_offset.shape,
     )
 
-    t0 = next(p0.get_tiles(tiling_scheme))
+    tiles = p0.get_tiles(tiling_scheme)
+    t0 = next(tiles)
     assert tuple(t0.tile_slice.origin) == (2, 0, 0)
+    for _ in tiles:
+        pass
 
     for p in ds_with_offset.get_partitions():
         for t in p.get_tiles(tiling_scheme=tiling_scheme):
@@ -280,6 +286,8 @@ def test_read(default_tvips):
     tiles = p.get_tiles(tiling_scheme=tiling_scheme)
     t = next(tiles)
     assert tuple(t.tile_slice.shape) == (2, 512, 512)
+    for _ in tiles:
+        pass
 
 
 @needsdata
@@ -302,6 +310,8 @@ def test_scheme_too_large(default_tvips):
     tiles = p.get_tiles(tiling_scheme=tiling_scheme)
     t = next(tiles)
     assert tuple(t.tile_slice.shape) == tuple((depth,) + default_tvips.shape.sig)
+    for _ in tiles:
+        pass
 
 
 @needsdata
@@ -446,3 +456,18 @@ def test_compare_backends_sparse(lt_ctx, default_tvips, buffered_tvips, as_spars
     buffered_f0 = lt_ctx.run_udf(dataset=buffered_tvips, udf=PickUDF(), roi=roi)['intensity']
 
     assert np.allclose(mm_f0, buffered_f0)
+
+
+def test_bad_params(ds_params_tester, standard_bad_ds_params):
+    args = ("tvips", TVIPS_TESTDATA_PATH)
+    for params in standard_bad_ds_params:
+        ds_params_tester(*args, **params)
+
+
+@needsdata
+def test_no_num_partitions(lt_ctx):
+    ds = lt_ctx.load(
+        "tvips",
+        path=TVIPS_TESTDATA_PATH,
+    )
+    lt_ctx.run_udf(dataset=ds, udf=SumSigUDF())

@@ -1,14 +1,14 @@
-from .state import SharedState
+import os
+import stat
+
 from libertem.common.messageconverter import MessageConverter  # NOQA: F401
+from libertem.common.progress import ProgressState
 
 
 class Message:
     """
     possible messages - the translation of our python datatypes to json types
     """
-
-    def __init__(self, state: SharedState):
-        self.state = state
 
     def initial_state(self, jobs, datasets, analyses, compound_analyses):
         return {
@@ -24,6 +24,27 @@ class Message:
         return {
             "status": "error",
             "messageType": "CLUSTER_CONN_ERROR",
+            "msg": msg,
+        }
+
+    def snooze(self, msg):
+        return {
+            "status": "ok",
+            "messageType": "SNOOZE",
+            "msg": msg,
+        }
+
+    def unsnooze(self, msg):
+        return {
+            "status": "ok",
+            "messageType": "UNSNOOZE",
+            "msg": msg,
+        }
+
+    def unsnooze_done(self, msg):
+        return {
+            "status": "ok",
+            "messageType": "UNSNOOZE_DONE",
             "msg": msg,
         }
 
@@ -81,13 +102,13 @@ class Message:
             "msg": reason,
         }
 
-    def start_job(self, job_id, analysis_id):
+    def start_job(self, serialized_job, analysis_id):
         return {
             "status": "ok",
             "messageType": "JOB_STARTED",
-            "job": job_id,
+            "job": serialized_job["id"],
             "analysis": analysis_id,
-            "details": self.state.job_state.serialize(job_id),
+            "details": serialized_job,
         }
 
     def job_error(self, job_id, msg):
@@ -98,12 +119,24 @@ class Message:
             "msg": msg,
         }
 
-    def finish_job(self, job_id, num_images, image_descriptions):
+    def job_progress(self, job_id: str, state: ProgressState, event: str):
+        return {
+            "status": "ok",
+            "messageType": "JOB_PROGRESS",
+            "job": job_id,
+            "details": {
+                "event": event,
+                "numFrames": state.num_frames_total,
+                "numFramesComplete": state.num_frames_complete,
+            }
+        }
+
+    def finish_job(self, serialized_job, num_images, image_descriptions):
         return {
             "status": "ok",
             "messageType": "FINISH_JOB",
-            "job": job_id,
-            "details": self.state.job_state.serialize(job_id),
+            "job": serialized_job["id"],
+            "details": serialized_job,
             "followup": {
                 "numMessages": num_images,
                 "descriptions": image_descriptions,
@@ -166,6 +199,38 @@ class Message:
                 _details(d)
                 for d in dirs
             ],
+        }
+
+    def browse_stat_result(
+        self,
+        path: str,
+        dirname: str,
+        basename: str,
+        stat_result: os.stat_result,
+    ):
+        return {
+            "status": "ok",
+            "messageType": "STAT_RESULT",
+            "path": path,
+            "dirname": dirname,
+            "basename": basename,
+            "stat": {
+                "size":  stat_result.st_size,
+                "ctime": stat_result.st_ctime,
+                "mtime": stat_result.st_mtime,
+                "isdir": bool(stat.S_ISDIR(stat_result.st_mode)),
+                "isreg": bool(stat.S_ISREG(stat_result.st_mode)),
+            }
+        }
+
+    def stat_failed(self, path, code, msg, alternative=None):
+        return {
+            "status": "error",
+            "messageType": "STAT_FAILED",
+            "path": path,
+            "code": code,
+            "msg": msg,
+            "alternative": alternative,
         }
 
     def browse_failed(self, path, code, msg, alternative=None):

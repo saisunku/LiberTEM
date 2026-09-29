@@ -1,22 +1,31 @@
+import os
 import contextlib
 from copy import deepcopy
 import functools
 import logging
+import copy
+import time
 import signal
-from typing import Iterable, Any, Optional, Tuple, Union, Dict, Callable, List
+from typing import Any
+from collections.abc import Callable
+from collections.abc import Iterable
+import uuid
 
 from dask import distributed as dd
 import dask
 
 from libertem.common.threading import set_num_threads_env
 
-from .base import BaseJobExecutor, AsyncAdapter
+from .base import BaseJobExecutor, AsyncAdapter, ResourceError, make_canonical
 from libertem.common.executor import (
     JobCancelledError, TaskCommHandler, TaskProtocol, Environment, WorkerContext,
+    GPUSpec
 )
+from libertem.common.snooze import SnoozeManager, keep_alive, keep_alive_context
+from libertem.common.subscriptions import SubscriptionManager
 from libertem.common.async_utils import sync_to_async
 from libertem.common.scheduler import Worker, WorkerSet
-from libertem.common.backend import set_use_cpu, set_use_cuda
+from libertem.common.backend import set_use_cpu, set_use_cuda, get_use_cuda
 from libertem.common.async_utils import adjust_event_loop_policy
 from .utils import assign_cudas
 
@@ -24,7 +33,7 @@ log = logging.getLogger(__name__)
 
 
 class DaskWorkerContext(WorkerContext):
-    def __init__(self, comms_topic: Optional[str]):
+    def __init__(self, comms_topic: str | None):
         # DaskWorkerContext sends all messages via a single unique topic id
         # which are later unpacked on the client node; this allows us to handle
         # concurrent runs using the same executor with separate comms channels
@@ -38,7 +47,7 @@ class DaskWorkerContext(WorkerContext):
             self._worker = dd.get_worker()
             return self._worker
 
-    def signal(self, ident: str, topic: str, msg_dict: Dict[str, Any]):
+    def signal(self, ident: str, topic: str, msg_dict: dict[str, Any]):
         if self._comms_topic is None:
             # Scheduler Dask does not have comms so don't send
             return
@@ -50,6 +59,33 @@ class DaskWorkerContext(WorkerContext):
             # Catch the exception here just in case there is
             # version / API mismatch
             pass
+
+
+@contextlib.contextmanager
+def set_worker_log_level(level: str | int, force: bool = False):
+    """
+    Set the dask.distributed log level for any processes spawned
+    within the context manager. If force is False, don't overwrite
+    any existing environment variable.
+    """
+    env_keys = ['DASK_DISTRIBUTED__LOGGING__DISTRIBUTED']
+    try:
+        old_env = {
+            k: os.environ[k]
+            for k in env_keys
+            if k in os.environ
+        }
+        os.environ.update({
+            k: str(level)
+            for k in env_keys
+            if force or (k not in old_env)
+        })
+        yield
+    finally:
+        os.environ.update(old_env)
+        for key in env_keys:
+            if key not in old_env:
+                del os.environ[key]
 
 
 def worker_setup(resource, device):
@@ -66,13 +102,13 @@ def worker_setup(resource, device):
 
 
 def cluster_spec(
-    cpus: Union[int, Iterable[int]],
-    cudas: Union[int, Iterable[int]],
+    cpus: int | Iterable[int],
+    cudas: int | Iterable[int],
     has_cupy: bool,
     name: str = 'default',
     num_service: int = 1,
-    options: Optional[dict] = None,
-    preload: Optional[Tuple[str]] = None
+    options: dict | None = None,
+    preload: tuple[str, ...] | None = None
 ):
     '''
     Create a worker specification dictionary for a LiberTEM Dask cluster
@@ -82,7 +118,7 @@ def cluster_spec(
     This creates a Dask cluster spec with special initializations and resource tags
     for CPU + GPU processing in LiberTEM.
     See :ref:`cluster spec` for an example.
-    See http://distributed.dask.org/en/stable/api.html#distributed.SpecCluster
+    See https://distributed.dask.org/en/stable/api.html#distributed.SpecCluster
     for more info on cluster specs.
 
     Parameters
@@ -110,7 +146,7 @@ def cluster_spec(
     preload
         Items to preload on workers in addition to LiberTEM-internal preloads.
         This can be used to load libraries, for example HDF5 filter plugins before h5py is used.
-        See https://docs.dask.org/en/stable/how-to/customize-initialization.html#preload-scripts
+        See https://docs.dask.org/en/stable/customize-initialization.html#preload-scripts
         for more information.
 
     See also
@@ -201,7 +237,7 @@ def cluster_spec(
     return workers_spec
 
 
-def _run_task(task, params, task_id, threaded_executor, comms_topic: Optional[str]):
+def _run_task(task, params, task_id, threaded_executor, comms_topic: str | None):
     """
     Very simple wrapper function. As dask internally caches functions that are
     submitted to the cluster in various ways, we need to make sure to
@@ -211,9 +247,11 @@ def _run_task(task, params, task_id, threaded_executor, comms_topic: Optional[st
     cache, which blows up memory usage over time.
     """
     worker_context = DaskWorkerContext(comms_topic)
+    gpu_id = get_use_cuda()
     env = Environment(threads_per_worker=1,
                       threaded_executor=threaded_executor,
-                      worker_context=worker_context)
+                      worker_context=worker_context,
+                      gpu_id=gpu_id)
     task_result = task(env=env, params=params)
     return {
         "task_result": task_result,
@@ -226,14 +264,22 @@ def _simple_run_task(task):
 
 
 class CommonDaskMixin:
-    def _task_idx_to_workers(self, workers, idx):
+    client: dd.Client
+
+    def _task_idx_to_workers(self, workers: WorkerSet, idx: int) -> WorkerSet:
         hosts = list(sorted(workers.hosts()))
         host_idx = idx % len(hosts)
         host = hosts[host_idx]
         return workers.filter(lambda w: w.host == host)
 
     def _future_for_location(
-        self, task, locations, resources, workers, task_args=None, wrap_fn=_run_task,
+        self,
+        task: TaskProtocol,
+        locations: WorkerSet,
+        resources,
+        workers: WorkerSet,
+        task_args=None,
+        wrap_fn=_run_task,
     ):
         """
         Submit tasks and return the resulting futures
@@ -255,10 +301,12 @@ class CommonDaskMixin:
         if locations is not None:
             if len(locations) == 0:
                 raise ValueError("no workers found for task")
-            locations = locations.names()
+            location_names = locations.names()
+        else:
+            location_names = None
         submit_kwargs.update({
             'resources': self._validate_resources(workers, resources),
-            'workers': locations,
+            'workers': location_names,
             'pure': False,
         })
         return self.client.submit(
@@ -269,11 +317,11 @@ class CommonDaskMixin:
         # This is set in the constructor of DaskJobExecutor
         if self.lt_resources:
             if not self._resources_available(workers, resources):
-                raise RuntimeError("Requested resources not available in cluster:", resources)
+                raise ResourceError("Requested resources not available in cluster:", resources)
             result = resources
         else:
             if 'CUDA' in resources:
-                raise RuntimeError(
+                raise ResourceError(
                     "Requesting CUDA resource on a cluster without resource management."
                 )
             result = {}
@@ -294,19 +342,27 @@ class CommonDaskMixin:
 
         return len(workers.filter(has_resources)) > 0
 
-    def _get_future(self, task, workers, idx, params_handle,
-                    threaded_executor, comms_topic: Optional[str]):
+    def _get_future(
+        self,
+        task: TaskProtocol,
+        workers: WorkerSet,
+        idx: int,
+        params_handle,
+        threaded_executor,
+        comms_topic: str | None
+    ):
         if len(workers) == 0:
             raise RuntimeError("no workers available!")
+        params_fut = self._scatter_map[params_handle]
         return self._future_for_location(
-            task,
-            task.get_locations() or self._task_idx_to_workers(
+            task=task,
+            locations=task.get_locations() or self._task_idx_to_workers(
                 workers, idx
             ),
-            task.get_resources(),
-            workers,
+            resources=task.get_resources(),
+            workers=workers,
             task_args=(
-                params_handle,
+                params_fut,
                 idx,
                 threaded_executor,
                 comms_topic,
@@ -314,7 +370,10 @@ class CommonDaskMixin:
         )
 
     def get_available_workers(self) -> WorkerSet:
-        info = self.client.scheduler_info()
+        try:
+            info = self.client.scheduler_info(n_workers=-1)
+        except TypeError:
+            info = self.client.scheduler_info()
         return WorkerSet([
             Worker(
                 name=worker['name'],
@@ -362,7 +421,7 @@ class CommonDaskMixin:
         return details_sorted
 
 
-def _dispatch_messages(subscribers: Dict[str, List[Callable]], dask_message: Tuple[float, Dict]):
+def _dispatch_messages(subscribers: dict[str, list[Callable]], dask_message: tuple[float, dict]):
     """
     Unpacks the Dask message format and forwards the message
     to all subscribed callbacks for that topic (if any)
@@ -387,20 +446,138 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
     lt_resources : bool
         Specify if the cluster has LiberTEM resource tags and environment
         variables for GPU processing. Autodetected by default.
+    main_process_gpu : int or None, optional
+        GPU to use for the environment of process-local tasks
     '''
     def __init__(self, client: dd.Client, is_local: bool = False,
-                lt_resources: bool = None):
+                lt_resources: bool = None, main_process_gpu: int | None = None):
         self.is_local = is_local
         self.client = client
         if lt_resources is None:
             lt_resources = self.has_libertem_resources()
         self.lt_resources = lt_resources
         self._futures = {}
+        self._scatter_map = {}
+        self._snooze_manager = None
+        self._worker_spec = None
+        self._subscriptions = SubscriptionManager()
+        super().__init__(main_process_gpu=main_process_gpu)
 
+    def _scale_down(self):
+        """
+        If possible, scale the cluster down to one worker
+        using Dask's :code:`cluster.scale`. Normally called by
+        :code:`SnoozeManager`. Returns immediately, though
+        Dask may take some time to shut down the extra workers
+        in the background. There is no way to ensure that the
+        remaining worker is the service (or even a CPU) worker.
+
+        :meta private:
+        """
+        if not self.is_local or self._worker_spec is None or self.client.cluster is None:
+            return
+        self.client.cluster.scale(n=1)
+        # cluster.scale returns immediately while workers are shut down
+        # in the background by Dask. To avoid a bad state where we
+        # `_scale_up` too quickly after calling this function then shutdown
+        # the cluster, wait at most a few seconds until the cluster has time
+        # to enact the call to `scale` before we hassle it with more requests
+        # See https://github.com/dask/distributed/pull/9064 for more info
+        t0 = time.monotonic()
+        t1 = t0 + 3  # seconds of settling time
+        while len(self.client.cluster.workers) > 1 and time.monotonic() < t1:
+            time.sleep(0.1)
+
+    def _scale_up(self):
+        """
+        If possible, scale the cluster back up to its initial
+        state using Dask's :code:`cluster.scale`. Normally called by
+        :code:`SnoozeManager`. The initial worker spec is stored in
+        :code:`self._worker_spec`, set by :code:`self._enable_snooze`,
+        as Dask deletes its copy of worker spec when scaling down.
+
+        This method blocks until the workers are up, though there is
+        an internal Dask async function (:code:`_wait_for_workers`) which
+        could be used for the web client.
+
+        :meta private:
+        """
+        if not self.is_local or self._worker_spec is None or self.client.cluster is None:
+            return
+        self.client.cluster.worker_spec = copy.copy(self._worker_spec)
+        self.client.cluster.scale(n=len(self._worker_spec))
+        # Block until our scale request is complete
+        # There is also an async client._wait_for_workers(n, timeout)
+        # which could be used in the web client, but it is nominally internal
+        self.client.wait_for_workers(len(self._worker_spec))
+
+    def _enable_snooze(self, timeout: float, spec: dict):
+        """
+        Enable the automatic snoozing on this executor,
+        with a snooze timeout in seconds.
+
+        :code:`spec` is the worker spec used to create the cluster
+        behind the executor, so that it can be re-supplied to Dask
+        during cluster scale_up.
+
+        :meta private:
+        """
+        if self._snooze_manager is not None:
+            return
+        self._snooze_manager = SnoozeManager(
+            up=self._scale_up,
+            down=self._scale_down,
+            timeout=timeout,
+            subscriptions=self._subscriptions,
+        )
+        self._worker_spec = copy.copy(spec)
+
+    @property
+    def snooze_manager(self):
+        return self._snooze_manager
+
+    def subscribe(self, topic: str, callback: Callable[[str, dict], None]) -> str:
+        return self._subscriptions.subscribe(topic, callback)
+
+    def unsubscribe(self, key: str) -> bool:
+        return self._subscriptions.unsubscribe(key)
+
+    @keep_alive_context
     @contextlib.contextmanager
     def scatter(self, obj):
-        yield self.client.scatter(obj, broadcast=True)
+        # an additional layer of indirection, because we want to be able to
+        # redirect keys to new values
+        handle = str(uuid.uuid4())
+        try:
+            fut = self.client.scatter(obj, broadcast=True, hash=False)
+            self._scatter_map[handle] = fut
+            yield handle
+        finally:
+            if handle in self._scatter_map:
+                del self._scatter_map[handle]
 
+    @keep_alive
+    def scatter_update(self, handle, obj):
+        fut = self.client.scatter(obj, broadcast=True, hash=False)
+        self._scatter_map[handle] = fut
+
+    @keep_alive
+    def scatter_update_patch(self, handle, patch):
+        fut = self._scatter_map[handle]
+
+        def _do_patch(obj):
+            if not hasattr(obj, 'patch'):
+                raise TypeError(f'object is not patcheable: {obj}')
+            obj.patch(patch)
+
+        # can't `client.run` here, as that doesn't resolve the scatter future
+        futures = []
+        for worker in self.get_available_workers().names():
+            futures.append(self.client.submit(_do_patch, fut, pure=False, workers=[worker]))
+        for res in dd.as_completed(futures, loop=self.client.loop):
+            pass
+
+    @keep_alive
     def run_tasks(
         self,
         tasks: Iterable[TaskProtocol],
@@ -446,6 +623,10 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
             as_completed = dd.as_completed(initial, with_results=True, loop=self.client.loop)
             for future, result_wrap in as_completed:
                 if future.cancelled():
+                    log.debug(
+                        "future %r is cancelled, stopping",
+                        future,
+                    )
                     del self._futures[cancel_id]
                     raise JobCancelledError()
                 result = result_wrap['task_result']
@@ -465,10 +646,12 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
                 self.client.unsubscribe_topic(topic_id)
 
     def cancel(self, cancel_id):
+        log.debug("cancelling with cancel_id=`%s`", cancel_id)
         if cancel_id in self._futures:
             futures = self._futures[cancel_id]
             self.client.cancel(futures)
 
+    @keep_alive
     def run_each_partition(self, partitions, fn, all_nodes=False):
         """
         Run `fn` for all partitions. Yields results in order of completion.
@@ -513,6 +696,7 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
                 raise JobCancelledError()
             yield result
 
+    @keep_alive
     def run_function(self, fn, *args, **kwargs):
         """
         run a callable :code:`fn` on any worker
@@ -521,6 +705,7 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
         future = self.client.submit(fn_with_args, priority=1, pure=False)
         return future.result()
 
+    @keep_alive
     def map(self, fn, iterable):
         """
         Run a callable :code:`fn` for each element in :code:`iterable`, on arbitrary worker nodes.
@@ -537,6 +722,7 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
         return [future.result()
                 for future in self.client.map(fn, iterable, pure=False)]
 
+    @keep_alive
     def run_each_host(self, fn, *args, **kwargs):
         """
         Run a callable :code:`fn` once on each host, gathering all results into
@@ -561,6 +747,7 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
         }
         return result_map
 
+    @keep_alive
     def run_each_worker(self, fn, *args, **kwargs):
         # Client.run() creates issues on Windows and OS X with Python 3.6
         # FIXME workaround may not be needed anymore for Python 3.7+
@@ -591,12 +778,14 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
             # use getattr just in case cluster is already gone
             if getattr(self.client, 'cluster', None) is not None:
                 self.client.cluster.close(timeout=30)
+            if self.snooze_manager is not None:
+                self.snooze_manager.close()
         # NOTE: distributed already registers atexit handlers for
         # both clients and clusters, this is here to allow manual closure
         # followed by creation of a new Executor without accumulating clusters
 
     @classmethod
-    def connect(cls, scheduler_uri, *args, client_kwargs: Optional[dict] = None, **kwargs):
+    def connect(cls, scheduler_uri, *args, client_kwargs: dict | None = None, **kwargs):
         """
         Connect to a remote dask scheduler.
 
@@ -626,8 +815,9 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
         return cls(client=client, is_local=is_local, *args, **kwargs)
 
     @classmethod
-    def make_local(cls, spec: Optional[dict] = None, cluster_kwargs: Optional[dict] = None,
-            client_kwargs: Optional[dict] = None, preload: Optional[Tuple[str]] = None):
+    def make_local(cls, spec: dict | None = None, cluster_kwargs: dict | None = None,
+            client_kwargs: dict | None = None, preload: tuple[str] | None = None,
+            snooze_timeout: float | None = None, main_process_gpu: GPUSpec = None):
         """
         Spin up a local dask cluster
 
@@ -635,7 +825,7 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
         ----------
         spec
             Dask cluster spec, see
-            http://distributed.dask.org/en/stable/api.html#distributed.SpecCluster
+            https://distributed.dask.org/en/stable/api.html#distributed.SpecCluster
             for more info.
             :func:`libertem.utils.devices.detect` allows to detect devices that can be used
             with LiberTEM, and :func:`cluster_spec` can be used to create a :code:`spec`
@@ -646,8 +836,10 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
             Passed to :class:`distributed.Client`. Pass
             :code:`client_kwargs={'set_as_default': True}` to set the Client as the
             default Dask scheduler.
-        preload: Optional[Tuple[str]]
+        preload: Tuple[str] | None
             Passed to :func:`cluster_spec` if :code:`spec` is :code:`None`.
+        main_process_gpu
+            GPU to use for the environment of process-local tasks
 
         Returns
         -------
@@ -659,10 +851,11 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
         # from within pytest as of version 2.21.0. For that reason we
         # adjust the policy ourselves here.
         adjust_event_loop_policy()
-
+        main_process_gpu = make_canonical(main_process_gpu)
         if spec is None:
             from libertem.utils.devices import detect
-            spec = cluster_spec(**detect(), preload=preload)
+            d = detect()
+            spec = cluster_spec(**d, preload=preload)
         else:
             if preload is not None:
                 raise ValueError(
@@ -679,7 +872,11 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
         if cluster_kwargs.get('silence_logs') is None:
             cluster_kwargs['silence_logs'] = logging.WARN
 
-        with set_num_threads_env(n=1):
+        dist_log_level = dask.config.get('distributed.logging.distributed', default=None)
+        if dist_log_level is None:
+            dist_log_level = cluster_kwargs['silence_logs']
+
+        with set_num_threads_env(n=1), set_worker_log_level(dist_log_level):
             # Mitigation for https://github.com/dask/distributed/issues/6776
             with dask.config.set({"distributed.worker.profile.enabled": False}):
                 cluster = dd.SpecCluster(workers=spec, **(cluster_kwargs or {}))
@@ -688,7 +885,15 @@ class DaskJobExecutor(CommonDaskMixin, BaseJobExecutor):
 
         is_local = not client_kwargs['set_as_default']
 
-        return cls(client=client, is_local=is_local, lt_resources=True)
+        executor = cls(
+            client=client,
+            is_local=is_local,
+            lt_resources=True,
+            main_process_gpu=main_process_gpu,
+        )
+        if snooze_timeout is not None:
+            executor._enable_snooze(snooze_timeout, spec)
+        return executor
 
     def __enter__(self):
         return self
@@ -714,28 +919,40 @@ class AsyncDaskJobExecutor(AsyncAdapter):
         return cls(wrapped=executor)
 
     @classmethod
-    async def make_local(cls, spec=None, cluster_kwargs=None, client_kwargs=None):
+    async def make_local(
+            cls, spec=None, cluster_kwargs=None, client_kwargs=None,
+            main_process_gpu: GPUSpec = None):
         executor = await sync_to_async(functools.partial(
             DaskJobExecutor.make_local,
             spec=spec,
             cluster_kwargs=cluster_kwargs,
             client_kwargs=client_kwargs,
+            main_process_gpu=main_process_gpu,
         ))
         return cls(wrapped=executor)
 
 
 def cli_worker(
-        scheduler, local_directory, cpus, cudas, has_cupy, name, log_level, preload: Tuple[str]):
+    scheduler,
+    local_directory,
+    cpus,
+    cudas,
+    has_cupy,
+    name,
+    log_level,
+    preload: tuple[str, ...]
+):
     import asyncio
 
     options = {
         "silence_logs": log_level,
         "local_directory": local_directory
-
     }
 
     spec = cluster_spec(
-        cpus=cpus, cudas=cudas, has_cupy=has_cupy, name=name, options=options, preload=preload)
+        cpus=cpus, cudas=cudas, has_cupy=has_cupy, name=name,
+        options=options, preload=preload,
+    )
 
     async def run(spec):
         # Mitigation for https://github.com/dask/distributed/issues/6776
@@ -751,4 +968,10 @@ def cli_worker(
             for w in workers:
                 await w.finished()
 
-    asyncio.get_event_loop().run_until_complete(run(spec))
+    adjust_event_loop_policy()
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    loop.run_until_complete(run(spec))

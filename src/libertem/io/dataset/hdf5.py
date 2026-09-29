@@ -1,6 +1,6 @@
+import os
 import contextlib
 import typing
-from typing import Optional, Tuple, List
 import warnings
 import logging
 import time
@@ -67,7 +67,7 @@ class HDF5DatasetParams(MessageConverter):
         return data
 
 
-def _ensure_2d_nav(nav_shape: Tuple[int, ...]) -> Tuple[int, int]:
+def _ensure_2d_nav(nav_shape: tuple[int, ...]) -> tuple[int, int]:
     # For any iterable shape, reduce or pad it to a 2-tuple
     # with the same prod(shape). Reduction from left to right
     # (final dimension preserved). Special case for empty
@@ -86,16 +86,20 @@ def _ensure_2d_nav(nav_shape: Tuple[int, ...]) -> Tuple[int, int]:
 
 class HDF5ArrayDescriptor(typing.NamedTuple):
     name: str
-    shape: Tuple[int]
+    shape: tuple[int, ...]
     dtype: np.dtype
-    compression: Optional[str]
-    chunks: Tuple[int]
+    compression: str | None
+    chunks: tuple[int, ...]
 
 
 def _get_datasets(path):
-    datasets: List[HDF5ArrayDescriptor] = []
+    datasets: list[HDF5ArrayDescriptor] = []
 
-    timeout = 3
+    try:
+        timeout = int(os.environ.get('LIBERTEM_IO_HDF5_TIMEOUT_DEBUG', 3))
+    except ValueError:
+        timeout = 3
+
     t0 = current_time()
 
     def _make_list(name, obj):
@@ -340,10 +344,13 @@ class H5DataSet(DataSet):
                 # so we currently don't support opening 2D HDF5 files
                 raise DataSetException("2D HDF5 files are currently not supported")
             ds_shape = Shape(shape, sig_dims=self.sig_dims)
-            if self._sig_shape is not None and self._sig_shape != ds_shape.sig.to_tuple():
+            if self._sig_shape is not None and tuple(self._sig_shape) != ds_shape.sig.to_tuple():
                 raise DataSetException("sig reshaping currently not supported with HDF5 files")
             self._image_count = ds_shape.nav.size
-            nav_shape = ds_shape.nav.to_tuple() if self._nav_shape is None else self._nav_shape
+            if self._nav_shape is None:
+                nav_shape = ds_shape.nav.to_tuple()
+            else:
+                nav_shape = tuple(self._nav_shape)
             self._shape = nav_shape + ds_shape.sig
             self._meta = DataSetMeta(
                 shape=self.shape,
@@ -501,7 +508,7 @@ class H5DataSet(DataSet):
         # un-chunked HDF5 seems to prefer larger signal slices, so we aim for 32 4k blocks:
         return 32 * 4096 // np.dtype(self.meta.raw_dtype).itemsize
 
-    def get_max_io_size(self) -> Optional[int]:
+    def get_max_io_size(self) -> int | None:
         if self._chunks is not None:
             # this may result in larger tile depth than necessary, but
             # it needs to be so big to pass the validation of the Negotiator. The tiles
@@ -866,7 +873,7 @@ class H5Partition(Partition):
         self._corrections = corrections
 
     def get_tiles(self, tiling_scheme: TilingScheme, dest_dtype="float32", roi=None,
-            array_backend: Optional[ArrayBackend] = None):
+            array_backend: ArrayBackend | None = None):
         if array_backend is None:
             array_backend = self.meta.array_backends[0]
         assert array_backend in (NUMPY, CUDA)

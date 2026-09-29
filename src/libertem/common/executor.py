@@ -1,23 +1,41 @@
 import queue
 from typing import (
-    Callable, Generator, Optional, Any, Iterable, TYPE_CHECKING, Tuple,
-    TypeVar, Type, Dict, List
+    Any, TYPE_CHECKING,
+    TypeVar, Union, Optional
 )
-from contextlib import contextmanager
+from collections.abc import Callable
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager, nullcontext
 import multiprocessing as mp
 
 import cloudpickle
+from opentelemetry import trace
 import numpy as np
 from typing_extensions import Protocol
+from typing import Literal
 
 from libertem.common.scheduler import WorkerSet
 from libertem.common.threading import set_num_threads, mitigations
+from libertem.common.cupy import use_gpu
 from libertem.io.dataset.base import Partition
+from libertem.utils.devices import has_cupy
 
 
 if TYPE_CHECKING:
     from libertem.udf.base import UDFParams, UDFRunner
+    from libertem.common.snooze import SnoozeManager
     from opentelemetry.trace import SpanContext
+
+ResourceDef = dict[
+    Literal[
+        'CPU', 'compute', 'ndarray', 'CUDA',
+    ],
+    int
+]
+
+GPUSpec = Union[int, bool] | None
+
+tracer = trace.get_tracer(__name__)
 
 
 class ExecutorError(Exception):
@@ -37,16 +55,18 @@ class Environment:
     '''
     def __init__(
         self,
-        threads_per_worker: Optional[int],
+        threads_per_worker: int | None,
         threaded_executor: bool,
         worker_context: Optional["WorkerContext"] = None,
+        gpu_id: int | None = None,
     ):
         self._threads_per_worker = threads_per_worker
         self._threaded_executor = threaded_executor
         self._worker_context = worker_context
+        self._gpu_id = gpu_id
 
     @property
-    def threads_per_worker(self) -> Optional[int]:
+    def threads_per_worker(self) -> int | None:
         """
         int or None : number of threads that a UDF is allowed to use in the `process_*` method.
                       For numba, pyfftw, OMP, MKL, OpenBLAS, this limit is set automatically;
@@ -80,20 +100,44 @@ class Environment:
         """
         return self._worker_context
 
+    @property
+    def gpu_id(self) -> int | None:
+        """
+        ID of the GPU to activate in CuPy when entering the environment,
+        as specified in the constructor.
+        """
+        return self._gpu_id
+
     @contextmanager
-    def enter(self):
+    def enter(self, enable_gpu: bool = True):
         """
         Note: we are using the @contextmanager decorator here,
         because with separate `__enter__`, `__exit__` methods,
         we can't easily delegate to `set_num_threads`, or other
         contextmanagers that may come later.
+
+        Parameters
+        ----------
+
+        enable_gpu : bool, default True
+            .. versionadded :: 0.16.0
+            Enable the GPU set in the constructor.
         """
-        with set_num_threads(self._threads_per_worker):
-            if self.threaded_executor:
-                with mitigations():
+        with use_gpu(self._gpu_id) if enable_gpu else nullcontext():
+            with set_num_threads(self._threads_per_worker):
+                with mitigations() if self.threaded_executor else nullcontext():
                     yield self
-            else:
-                yield self
+
+    @property
+    def device_class(self) -> Literal['cpu', 'cuda']:
+        if self.gpu_id is None:
+            return 'cpu'
+        else:
+            return 'cuda'
+
+    @property
+    def has_cupy(self) -> bool:
+        return has_cupy()
 
 
 class TaskProtocol(Protocol):
@@ -107,6 +151,20 @@ class TaskProtocol(Protocol):
         ...
 
     def get_partition(self) -> Partition:
+        ...
+
+    def get_resources(self) -> ResourceDef:
+        ...
+
+
+class GenericTaskProtocol(Protocol):
+    '''
+    Interface for generic tasks
+    '''
+    def __call__(self, args, kwargs, environment: Environment):
+        pass
+
+    def get_tracing_span_context(self) -> "SpanContext":
         ...
 
 
@@ -124,6 +182,47 @@ class JobExecutor:
         """
         raise NotImplementedError()
 
+    def run_process_local(self, task: GenericTaskProtocol, args=(), kwargs: dict | None = None):
+        """
+        run a callable :code:`fn` in the context of the current process.
+        """
+        raise NotImplementedError()
+
+    def scatter_update(self, handle, obj):
+        '''
+        Update :code:`handle` to point to :code:`obj`
+
+        Must have been scattered before using :meth:`scatter`.
+
+        Parameters
+        ----------
+        handle
+            The handle, as returned from :meth:`scatter`.
+
+        obj
+            Some kind of Python object. Must be serializable.
+        '''
+        raise NotImplementedError()
+
+    def scatter_update_patch(self, handle, patch):
+        '''
+        Update :code:`handle` by remotely calling :code:`obj.patch(patch)` on
+        the underlying object.
+
+        The referenced object must have a :code:`patch` method, and
+        must have been scattered before using :meth:`scatter`.
+
+        Parameters
+        ----------
+        handle
+            The handle, as returned from :meth:`scatter`.
+
+        patch
+            Some kind of Python object. Must be serializable
+            and must match the :code:`obj.patch()` method.
+        '''
+        raise NotImplementedError()
+
     @contextmanager
     def scatter(self, obj):
         '''
@@ -133,7 +232,7 @@ class JobExecutor:
         ----------
 
         obj
-            Some kind of Python object or variable
+            Some kind of Python object. Must be serializable.
 
         Returns
         -------
@@ -150,7 +249,13 @@ class JobExecutor:
         task_comm_handler: "TaskCommHandler",
     ):
         """
-        Run the tasks with the given parameters
+        Run the tasks with the given parameters.
+
+        Raises
+        ------
+        JobCancelledError
+            Either the job was cancelled using :meth:`AsyncJobExecutor.cancel`,
+            or the underlying data source was interrupted.
 
         Parameters
         ----------
@@ -258,7 +363,7 @@ class JobExecutor:
         """
         raise NotImplementedError()
 
-    def get_resource_details(self):
+    def get_resource_details(self) -> list[dict[str, Any]]:
         """
         Returns a list of dicts with cluster details
 
@@ -292,8 +397,39 @@ class JobExecutor:
         """
         return buf
 
-    def get_udf_runner(self) -> Type['UDFRunner']:
+    def get_udf_runner(self) -> type['UDFRunner']:
         raise NotImplementedError
+
+    @property
+    def snooze_manager(self) -> Optional['SnoozeManager']:
+        """
+        Return the SnoozeManager for this executor, if it exists
+        """
+        return None
+
+    def subscribe(self, topic: str, callback: Callable[[str, dict], None]) -> str:
+        """
+        Register a callback to run in response to executor events
+
+        The callback should accept the arguments
+
+        :code:`(topic, message_dict)`
+
+        and not block execution as it will be run synchronously
+        within code such as :code:`executor.run_tasks`
+
+        Returns a key for the subscription which can
+        later be used to unsubscribe
+        """
+        raise NotImplementedError()
+
+    def unsubscribe(self, key: str) -> bool:
+        """
+        Unregister a callback based on the key returned by :code:`subscribe`
+
+        Return True if sucessfully unsubscribed, else False (e.g. unrecognized key)
+        """
+        raise NotImplementedError()
 
 
 class AsyncJobExecutor:
@@ -378,7 +514,7 @@ class AsyncJobExecutor:
         """
         return self
 
-    def get_udf_runner(self) -> Type['UDFRunner']:
+    def get_udf_runner(self) -> type['UDFRunner']:
         raise NotImplementedError()
 
 
@@ -398,11 +534,11 @@ class WorkerQueue:
     def get(
         self,
         block: bool = True,
-        timeout: Optional[float] = None,
-    ) -> Generator[Tuple[Any, memoryview], None, None]:
+        timeout: float | None = None,
+    ) -> Generator[tuple[Any, memoryview], None, None]:
         raise NotImplementedError()
 
-    def put(self, header: Any, payload: Optional[memoryview] = None):
+    def put(self, header: Any, payload: memoryview | None = None):
         '''
         Put header and payload into the queue.
         '''
@@ -447,6 +583,15 @@ class WorkerQueue:
         """
         raise NotImplementedError()
 
+    def size(self) -> int:
+        """
+        Approximate number of items currently in the queue
+
+        Can raise `NotImplementedError` depending on operating system
+        or underlying implementation.
+        """
+        raise NotImplementedError()
+
 
 class SimpleWorkerQueue(WorkerQueue):
     """
@@ -456,7 +601,7 @@ class SimpleWorkerQueue(WorkerQueue):
     def __init__(self) -> None:
         self.q: queue.Queue = queue.Queue()
 
-    def put(self, header, payload: Optional[memoryview] = None):
+    def put(self, header, payload: memoryview | None = None):
         self.q.put((header, payload))
 
     @contextmanager
@@ -466,7 +611,7 @@ class SimpleWorkerQueue(WorkerQueue):
         self.q.put((header, payload))
 
     @contextmanager
-    def get(self, block: bool = True, timeout: Optional[float] = None):
+    def get(self, block: bool = True, timeout: float | None = None):
         try:
             res = self.q.get(block=block, timeout=timeout)
             yield res
@@ -475,6 +620,9 @@ class SimpleWorkerQueue(WorkerQueue):
 
     def close(self, drain: bool = True, force: bool = False):
         pass
+
+    def size(self) -> int:
+        return self.q.qsize()
 
 
 class SimpleMPWorkerQueue(WorkerQueue):
@@ -486,10 +634,15 @@ class SimpleMPWorkerQueue(WorkerQueue):
         self.q: mp.Queue = self._mp_ctx.Queue()
         self._closed = False
 
-    def put(self, header, payload: Optional[memoryview] = None):
-        header_serialized = cloudpickle.dumps(header)
-        payload_serialized = cloudpickle.dumps(payload)
-        self.q.put((header_serialized, payload_serialized))
+    def put(self, header, payload: memoryview | None = None):
+        with tracer.start_as_current_span("SimpleMPWorkerQueue.put") as span:
+            header_serialized = cloudpickle.dumps(header)
+            payload_serialized = cloudpickle.dumps(payload)
+            span.set_attributes({
+                'libertem.pickle.header_size': len(header_serialized),
+                'libertem.pickle.payload_size': len(payload_serialized),
+            })
+            self.q.put((header_serialized, payload_serialized))
 
     @contextmanager
     def put_nocopy(self, header: Any, size: int) -> Generator[memoryview, None, None]:
@@ -500,7 +653,7 @@ class SimpleMPWorkerQueue(WorkerQueue):
         self.q.put((header_serialized, payload_serialized))
 
     @contextmanager
-    def get(self, block: bool = True, timeout: Optional[float] = None):
+    def get(self, block: bool = True, timeout: float | None = None):
         try:
             res = self.q.get(block=block, timeout=timeout)
             yield (cloudpickle.loads(res[0]), cloudpickle.loads(res[1]))
@@ -522,6 +675,9 @@ class SimpleMPWorkerQueue(WorkerQueue):
                 self.q.join_thread()
             self._closed = True
 
+    def size(self) -> int:
+        return self.q.qsize()
+
 
 class WorkerContext:
     """
@@ -531,7 +687,7 @@ class WorkerContext:
     def get_worker_queue(self) -> WorkerQueue:
         raise NotImplementedError()
 
-    def signal(self, ident: str, topic: str, msg_dict: Dict[str, Any]):
+    def signal(self, ident: str, topic: str, msg_dict: dict[str, Any]):
         raise NotImplementedError()
 
 
@@ -547,6 +703,9 @@ class TaskCommHandler:
         block until the communication for the given task has finished.
         It may be run in a background thread on the main node,
         or synchronously, depending on the :class:`JobExecutor`.
+
+        May raise :class:`JobCancelledError` to signal that the acquisition has
+        been cancelled for some reason.
 
         Parameters
         ----------
@@ -579,7 +738,7 @@ class TaskCommHandler:
         ...
 
     @property
-    def subscriptions(self) -> Dict[str, List[Callable]]:
+    def subscriptions(self) -> dict[str, list[Callable]]:
         # Instantiate on first get to avoid creating __init__
         try:
             return self._subscriptions
@@ -587,7 +746,7 @@ class TaskCommHandler:
             self._subscriptions = {}
             return self._subscriptions
 
-    def subscribe(self, topic: str, callback: Callable[[str, Dict], None]):
+    def subscribe(self, topic: str, callback: Callable[[str, dict], None]):
         """
         Register a callback to run in response to messages
         matching the topic string identifier

@@ -47,7 +47,7 @@ branch for each pull request.
 All pull requests should come from a user's personal fork since we don't push to
 the main repository for development. See the `GitHub documentation on how to
 create and manage forks
-<https://docs.github.com/en/get-started/quickstart/fork-a-repo>`_
+<https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/fork-a-repo>`_
 for details.
 
 Before creating a pull request, please make sure all tests still pass. See
@@ -110,7 +110,7 @@ using the following comment on the PR:
 If everything is good to go, your changes will be merged and you can
 delete the branch you created for the pull request.
 
-.. seealso:: `Guide on understanding the GitHub flow <https://docs.github.com/en/get-started/quickstart/github-flow>`_
+.. seealso:: `Guide on understanding the GitHub flow <https://docs.github.com/en/get-started/using-github/github-flow>`_
 
 .. seealso:: `How to make a simple GitHub PR (video) <https://www.youtube.com/watch?v=cysuuUtbC6E>`_
 
@@ -126,7 +126,7 @@ different Python versions and interpreter implementations.
 This makes sure that you can run the tests locally the same way as they are run
 in continuous integration.
 
-After `installing tox <https://tox.wiki/en/latest/install.html>`_, you
+After `installing tox <https://tox.wiki/en/latest/installation.html>`_, you
 can run the tests on all Python versions by simply running tox:
 
 .. code-block:: shell
@@ -293,7 +293,7 @@ Then, in the same directory, to run the tests execute:
 
 .. code-block:: shell
 
-   $ npm test -- --coverage
+   $ npm run coverage
 
 This will run all tests and report code coverage. If you want to run the tests
 while developing the client, you can run them in watch mode, which is the
@@ -307,9 +307,9 @@ default:
 Code style
 ----------
 
-We try to keep our code `PEP8 <https://www.python.org/dev/peps/pep-0008/>`_
+We try to keep our code `PEP8 <https://peps.python.org/pep-0008/>`_
 -compliant, with line-length relaxed to 100 chars, and some rules ignored. See
-the flake8 section in :code:`setup.cfg` for the current PEP8 settings. As a
+the file :code:`.flake8` in the root for the current PEP8 settings. As a
 general rule, try to keep your changes in a similar style as the surrounding
 code.
 
@@ -334,7 +334,7 @@ Mypy type annotations
 ~~~~~~~~~~~~~~~~~~~~~
 
 We are starting to introduce type annotations and checking them in CI with
-`mypy <http://mypy-lang.org/>`_.
+`mypy <https://mypy-lang.org/>`_.
 Adding type annotations improves developer experience, especially by improving
 auto completion and type information on hover in IDEs. Type checking is
 currently quite lax and opt-in. See the file
@@ -351,12 +351,12 @@ You can run mypy locally on all files that opt in with:
 Please note that in many cases the type for classes is specified with a string
 instead of the class itself. That allows to import classes for typing only if
 type checking is performed. See `the section on forward references in PEP484
-<https://www.python.org/dev/peps/pep-0484/#forward-references>`_ for more
+<https://peps.python.org/pep-0484/#forward-references>`_ for more
 information.
 
 For general information on type annotations in Python, including best
 practices, please also see `Static Typing with Python
-<https://typing.readthedocs.io/en/latest/>`_.
+<https://typing.python.org/en/latest/>`_.
 
 Docstrings
 ~~~~~~~~~~
@@ -427,6 +427,8 @@ changing to the client directory and running the install command:
    It is always a good idea to start development with installing the current
    dependencies with the above command. Having old versions of dependencies
    installed may cause the build to fail or cause unpredictable failures.
+   In some cases, it makes sense to completely remove the ``node_modules``
+   folder before installing the node dependencies.
 
 Once this command finished without errors, you can start a development server
 (also from the client directory):
@@ -435,8 +437,10 @@ Once this command finished without errors, you can start a development server
 
    $ npm run start
 
+You can then press the :code:`o` key to open the LiberTEM GUI in your default browser.
+
 This server watches all source files for changes and automatically starts the
-build process. The development server, which listens on port 3000, will only be
+build process. The development server will only be
 able to serve requests for JavaScript and other static files. For handling HTTP
 API requests you still need to run the Python :code:`libertem-server` process on
 the default port (9000) alongside the development server:
@@ -449,7 +453,15 @@ This allows proxying the HTTP API requests from the front-end server to the API
 server without opening an additional browser window that could interfere with
 the development server.
 
-To learn more about the build process, please see `the README in the client
+You can influence where the web API requests end up using environment variables,
+for example if you run it on a non-standard port, or if you are running the API server
+on another host:
+
+.. code-block:: shell
+
+   $ API_HOST=127.0.0.1 API_PORT=9001 npm run start
+
+To learn more about the build process, please see also `the README in the client
 directory <https://github.com/LiberTEM/LiberTEM/blob/master/client/README.md>`_.
 
 You can then use any editor you like to change the client source files, in the

@@ -1,5 +1,5 @@
 import { ActionCreatorsMapObject } from "redux";
-import { AnalysisDetails, CompoundAnalysisDetails, CreateDatasetMessage, FollowupPart, MsgPartAnalysis, MsgPartCompoundAnalysis, MsgPartInitialDataset, MsgPartJob } from "../messages";
+import { AnalysisDetails, CompoundAnalysisDetails, CreateDatasetMessage, FollowupPart, MsgPartAnalysis, MsgPartCompoundAnalysis, MsgPartInitialDataset, MsgPartJob, ProgressDetails } from "../messages";
 
 export interface Message<T extends string> {
     messageType: T
@@ -10,11 +10,15 @@ export const createMessage = <T extends string, O>(messageType: T, attribs: O) =
 export enum MessageTypes {
     INITIAL_STATE = "INITIAL_STATE",
     JOB_STARTED = "JOB_STARTED",
+    JOB_PROGRESS = "JOB_PROGRESS",
     FINISH_JOB = "FINISH_JOB",
     TASK_RESULT = "TASK_RESULT",
     JOB_ERROR = "JOB_ERROR",
     BINARY = "BINARY",
     OPEN = "OPEN",
+    SNOOZE = "SNOOZE",
+    UNSNOOZE = "UNSNOOZE",
+    UNSNOOZE_DONE = "UNSNOOZE_DONE",
     CLOSE = "CLOSE",
     ERROR = "ERROR",
     DELETE_DATASET = "DELETE_DATASET",
@@ -40,12 +44,16 @@ export const Messages = {
     }),
 
     startJob: (job: string) => createMessage(MessageTypes.JOB_STARTED, { job }),
+    jobProgress: (job: string, details: ProgressDetails) => createMessage(MessageTypes.JOB_PROGRESS, { job, details }),
     finishJob: (job: string, followup: FollowupPart) => createMessage(MessageTypes.FINISH_JOB, { job, followup }),
     taskResult: (job: string, followup: FollowupPart) => createMessage(MessageTypes.TASK_RESULT, { job, followup }),
     jobError: (job: string, msg: string) => createMessage(MessageTypes.JOB_ERROR, { job, msg }),
     binary: (objectURL: string) => createMessage(MessageTypes.BINARY, { objectURL }),
     open: () => createMessage(MessageTypes.OPEN, {}),
     close: () => createMessage(MessageTypes.CLOSE, {}),
+    snooze: () => createMessage(MessageTypes.SNOOZE, {}),
+    unsnooze: () => createMessage(MessageTypes.UNSNOOZE, {}),
+    unsnooze_done: () => createMessage(MessageTypes.UNSNOOZE_DONE, {}),
     error: (msg: string) => createMessage(MessageTypes.ERROR, { msg }),
     deleteDataset: (dataset: string) => createMessage(MessageTypes.DELETE_DATASET, { dataset }),
     createDataset: (dataset: string, details: CreateDatasetMessage) => createMessage(MessageTypes.CREATE_DATASET, { dataset, details }),

@@ -19,9 +19,9 @@ Debugging the Web GUI
 
 For debugging the GUI, you can use all standard debugging tools for web development. Most useful
 in this context are the `Chrome DevTools <https://developer.chrome.com/docs/devtools/>`_
-or `Firefox Developer Tools <https://developer.mozilla.org/en-US/docs/Tools>`_, which can be
+or `Firefox Developer Tools <https://firefox-source-docs.mozilla.org/devtools-user/index.html>`_, which can be
 accessed by pressing F12. You can extend these with additional panels
-`for React <https://reactjs.org/blog/2019/08/15/new-react-devtools.html>`_
+`for React <https://react.dev/learn/react-developer-tools>`_
 and `for Redux <https://github.com/reduxjs/redux-devtools>`_.
 
 These tools can be used for inspecting all frontend-related processes, from network traffic
@@ -70,7 +70,7 @@ instruct LiberTEM to use simple single-threaded execution using the
 
 
 You can then use all usual debugging facilities, including
-`pdb <https://docs.python.org/3.7/library/pdb.html>`_ and
+`pdb <https://docs.python.org/3.12/library/pdb.html>`_ and
 `the %pdb magic of ipython/Jupyter <https://ipython.org/ipython-doc/3/interactive/magics.html#magic-pdb>`_.
 
 The :class:`libertem.executor.inline.InlineJobExecutor` uses a single CPU core
@@ -149,7 +149,7 @@ events and functions executing concurrently. Crucially, it is possible to
 gather traces in distributed systems, from different nodes.
 
 For an overview of opentelemetry, please see `the official opentelemetry documentation
-<https://opentelemetry.io/docs/reference/specification/overview/>`_ - here, we
+<https://opentelemetry.io/docs/specs/otel/overview/>`_ - here, we
 will document the practical setup and usage. For the Python API docs, please
 see the `opentelemetry Python API docs <https://opentelemetry-python.readthedocs.io/en/latest/>`_.
 
@@ -216,9 +216,9 @@ On Windows
 ~~~~~~~~~~
 
 The easiest way to get the tracing services up and running is using
-`Windows Subsystem for Linux <https://docs.microsoft.com/en-us/windows/wsl/install>`_
+`Windows Subsystem for Linux <https://learn.microsoft.com/en-us/windows/wsl/install>`_
 to install Linux and Docker. This allows to run the tracing services as described above.
-Alternatively, `Docker Desktop for Windows <https://docs.docker.com/desktop/windows/install/>`_
+Alternatively, `Docker Desktop for Windows <https://docs.docker.com/desktop/setup/install/windows-install/>`_
 could be an option.
 
 Clients running natively on Windows can then connect to these services:

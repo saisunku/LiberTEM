@@ -1,9 +1,10 @@
 from io import BytesIO
-from typing import (
-    Callable, Dict, List, Optional, Union
-)
+from typing import Union
+from collections.abc import Callable
 
 import numpy as np
+
+from .compat import copy_if_needed
 
 
 class AnalysisResult:
@@ -50,10 +51,10 @@ class AnalysisResult:
     def __repr__(self):
         return "<AnalysisResult: %s>" % self.key
 
-    def __array__(self):
-        return np.array(self.raw_data)
+    def __array__(self, copy=copy_if_needed, dtype=None):
+        return np.array(self.raw_data, copy=copy, dtype=dtype)
 
-    def get_image(self, save_kwargs: Optional[Dict] = None) -> BytesIO:
+    def get_image(self, save_kwargs: dict | None = None) -> BytesIO:
         from libertem.common.viz import encode_image
         return encode_image(self.visualized, save_kwargs=save_kwargs)
 
@@ -64,7 +65,7 @@ class AnalysisResult:
         return self._visualized
 
 
-_ResultsType = Union[List[AnalysisResult], Callable[[], List[AnalysisResult]]]
+_ResultsType = Union[list[AnalysisResult], Callable[[], list[AnalysisResult]]]
 
 
 class AnalysisResultSet:

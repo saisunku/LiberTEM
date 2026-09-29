@@ -1,6 +1,7 @@
 import functools
 import warnings
 import logging
+from typing_extensions import TypedDict
 
 import psutil
 
@@ -21,7 +22,13 @@ except ImportError as e:
     cupy = None
 
 
-def detect():
+class DetectResult(TypedDict):
+    cpus: list[int]
+    cudas: list[int]
+    has_cupy: bool
+
+
+def detect() -> DetectResult:
     '''
     Detect which devices are present
 
@@ -53,7 +60,7 @@ def detect():
     }
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def has_cupy():
     '''
     Probe if :code:`cupy` was loaded successfully.

@@ -1,4 +1,6 @@
-from typing import Union, Callable, Iterable
+from typing import Union
+from collections.abc import Callable
+from collections.abc import Iterable
 
 import numpy as np
 import scipy.sparse as sp
@@ -78,7 +80,7 @@ def sparse_template_multi_stack(mask_index, offsetX, offsetY, template, imageSiz
 
     return sparse.COO(
         data=data[selector],
-        coords=(coord_mask[selector], coord_y[selector], coord_x[selector]),
+        coords=np.stack((coord_mask[selector], coord_y[selector], coord_x[selector]), axis=0),
         shape=(int(max(mask_index) + 1), imageSizeY, imageSizeX)
     )
 
@@ -320,7 +322,13 @@ def radial_bins(centerX, centerY, imageSizeX, imageSizeY,
                 s = vals.sum()
                 if not np.isclose(s, 0):
                     vals /= s
-            slices.append(sparse.COO(shape=len(r), data=vals.astype(dtype), coords=(jjs[select],)))
+            slices.append(
+                sparse.COO(
+                    shape=(len(r), ),
+                    data=vals.astype(dtype),
+                    coords=(jjs[select])
+                )
+            )
         else:
             if normalize:  # Make sure each bin has a sum of 1
                 s = vals.sum()
@@ -335,7 +343,7 @@ def radial_bins(centerX, centerY, imageSizeX, imageSizeY,
             if use_sparse:
                 index = yy * imageSizeX + xx
                 diff = 1 - slices[0][index] - radius_inner
-                patch = sparse.COO(shape=len(r), data=[diff], coords=[index])
+                patch = sparse.COO(shape=len(r), data=np.array([diff]), coords=np.array([index]))
                 slices[0] += patch
             else:
                 slices[0][yy, xx] = 1 - radius_inner

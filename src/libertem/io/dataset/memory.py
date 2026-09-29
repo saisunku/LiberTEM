@@ -1,6 +1,7 @@
 import time
 import logging
-from typing import Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING
+from collections.abc import Sequence
 
 import psutil
 import numpy as np
@@ -207,10 +208,8 @@ class MemoryDataSet(DataSet):
     Examples
     --------
 
-    >>> from libertem.io.dataset.memory import MemoryDataSet
-    >>>
-    >>> data = np.zeros((2, 2, 128, 128))
-    >>> ds = MemoryDataSet(data=data)
+    >>> data = np.zeros((2, 2, 64, 64), dtype=np.float32)
+    >>> ds = ctx.load('memory', data=data, sig_dims=2)
     '''
     def __init__(self, tileshape=None, num_partitions=None, data=None, sig_dims=None,
                  check_cast=True, tiledelay=None, datashape=None, base_shape=None,
@@ -361,8 +360,8 @@ class MemoryDataSet(DataSet):
         return super().get_base_shape(roi)
 
     def adjust_tileshape(
-        self, tileshape: Tuple[int, ...], roi: Optional[np.ndarray],
-    ) -> Tuple[int, ...]:
+        self, tileshape: tuple[int, ...], roi: np.ndarray | None,
+    ) -> tuple[int, ...]:
         if self.tileshape is not None:
             return tuple(self.tileshape)
         return super().adjust_tileshape(tileshape, roi)

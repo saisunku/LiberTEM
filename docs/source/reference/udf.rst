@@ -29,6 +29,8 @@ Base UDF classes
     :members:
     :inherited-members:
 
+.. autoenum:: libertem.common.udf.UDFMethod
+
 Alternative merging for Dask arrays
 ###################################
 
@@ -50,6 +52,11 @@ Pre- and postprocessing
 .. autoclass:: libertem.udf.base.UDFPostprocessMixin
     :members:
 
+Exceptions
+##########
+
+.. autoclass:: libertem.common.exceptions.UDFException
+
 .. _`run udf ref`:
 
 Running UDFs
@@ -65,6 +72,10 @@ Result type for UDF result iterators:
 
 .. autoclass:: libertem.udf.base.UDFResults
     :members:
+
+Exception for cancelled UDF run:
+
+.. autoclass:: libertem.common.exceptions.UDFRunCancelled
 
 .. _`buffer udf ref`:
 
@@ -123,6 +134,26 @@ Sum per frame
 .. autoclass:: libertem.udf.sumsigudf.SumSigUDF
     :members:
 
+.. _`com udf`:
+
+Centre-of-Mass
+##############
+
+.. autoclass:: libertem.udf.com.CoMUDF
+    :members: with_params
+
+The :code:`CoMUDF` has two helper classes used to parametrise it:
+
+.. autonamedtuple:: libertem.udf.com.CoMParams
+
+.. autoenum:: libertem.udf.com.RegressionOptions
+
+There is also a function available to guess sensible CoM parameters:
+
+.. autofunction:: libertem.udf.com.guess_corrections
+
+.. autonamedtuple:: libertem.udf.com.GuessResult
+
 .. _`masks udf`:
 
 Apply masks
@@ -137,6 +168,22 @@ Load data
 #########
 
 .. autoclass:: libertem.udf.raw.PickUDF
+    :members:
+
+.. _`ref auto udf`:
+
+AutoUDF
+#######
+
+.. autoclass:: libertem.udf.auto.AutoUDF
+    :members:
+
+.. _`record udf`:
+
+Save data
+#########
+
+.. autoclass:: libertem.udf.record.RecordUDF
     :members:
 
 NoOp

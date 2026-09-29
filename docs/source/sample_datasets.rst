@@ -14,7 +14,7 @@ with one file using a standard circular aperture and another using a bullseye
 aperture.
 
 :Link:
-    https://zenodo.org/record/3592520 :cite:`ophus_colin_2019_3592520,Zeltmann2019`
+    https://doi.org/10.5281/zenodo.3592520 :cite:`ophus_colin_2019_3592520,Zeltmann2019`
 :Format:
     HDF5 (uint16)
 :Dimension:
@@ -29,7 +29,7 @@ Scanning convergent beam electron diffraction with ring-shaped aperture and
 overlapping diffraction orders.
 
 :Link:
-    https://zenodo.org/record/2566137 :cite:`giulio_guzzinati_2019_2566137,Guzzinati2019`
+    https://doi.org/10.5281/zenodo.2566137 :cite:`giulio_guzzinati_2019_2566137,Guzzinati2019`
 :Format:
     Stack of DM3 (currently only scripting)
 :Dimension:
@@ -46,7 +46,7 @@ This dataset can be used to test various analysis methods for high-resolution 4D
 STEM, including phase contrast methods such as ptychography.
 
 :Link:
-    https://zenodo.org/record/5113449 :cite:`strauch_achim_2021_5113449`
+    https://doi.org/10.5281/zenodo.5113449 :cite:`strauch_achim_2021_5113449`
 :Format:
     MIB (6 bit)
 :Dimension:
@@ -63,13 +63,26 @@ This dataset allows to investigate phase contrast methods for 4D scanning
 transmission electron microscopy, such as ptychography.
 
 :Link:
-    https://zenodo.org/record/5113235 :cite:`strauch_achim_2021_5113235`
+    https://doi.org/10.5281/zenodo.5113235 :cite:`strauch_achim_2021_5113235`
 :Format:
     RAW (float32)
 :Dimension:
     4D (100, 100, 596, 596)
 :Size:
     14.2 GB
+
+
+Graphene simulated dataset
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Link:
+    https://doi.org/10.5281/zenodo.4476506 :cite:`t_pennycook_2021_4476506`
+:Format:
+    NPY (float32)
+:Dimension:
+    4D (64, 65, 256, 256)
+:Size:
+    1.1 GB
 
 Creating random data
 ~~~~~~~~~~~~~~~~~~~~~~~

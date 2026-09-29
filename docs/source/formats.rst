@@ -4,10 +4,13 @@ Loading data
 ============
 
 To efficiently handle files larger than main memory, LiberTEM never loads the
-whole data set into memory. Calling the :meth:`~libertem.api.Context.load`
-function only opens the data set and gives back a handle; running an analysis
-with :meth:`~libertem.api.Context.run` or a UDF with
-:meth:`~libertem.api.Context.run_udf` then streams the data from mass storage.
+whole data set at once. Calling the :meth:`~libertem.api.Context.load`
+function only checks that the dataset exists and is value before providing Python
+with an object which can be used in later computation. Running an analysis
+on this object with :meth:`~libertem.api.Context.run` or
+:meth:`~libertem.api.Context.run_udf` then streams the data from mass storage
+in optimal-sized chunks, such that even very large datasets can be processed without
+saturating the system resources.
 
 See :ref:`sample data` for publicly available datasets for testing.
 
@@ -48,11 +51,11 @@ are only available in the Python API. Tuples (for example for :code:`nav_shape`)
 have to be entered as separated values into the fields. You can hit a comma to jump to
 the next field. We follow the NumPy convention here and specify the "fast-access" dimension
 last, so a value of :code:`42`, :code:`21` would mean the same as specifying
-:code:`(42, 21)` in the Python API, setting :code:`y=42` and :code:`x=21`. Note that the GUI
-is currently limited to 2D visualizations, while the scripting API can handle more
-general cases.
+:code:`(42, 21)` in the Python API, setting :code:`y=42` and :code:`x=21`.
 
-See also :ref:`the concepts section <concepts>`.
+See the :ref:`GUI usage page <usage documentation>` for more information on the GUI. 
+
+For more general information about how LiberTEM structures data see :ref:`the concepts section <concepts>`.
 
 Common parameters
 ~~~~~~~~~~~~~~~~~
@@ -112,4 +115,30 @@ elsewhere in Python via other libraries:
 - a Dask data set can be constructed from a Dask array. Depending on the
   method used to construct the source array this can achieve good performance.
   See :ref:`daskds` for details.
-  
+
+.. _`data conversion`:
+
+Dataset conversion
+~~~~~~~~~~~~~~~~~~
+
+LiberTEM supports a mechanism to efficiently convert any supported dataset 
+into a Numpy binary file (:code:`.npy`), which can then be loaded into memory
+independently of LiberTEM (or read as a :code:`npy` format dataset as above).
+
+.. versionadded:: 0.12.0
+
+To convert a dataset to npy, use the :meth:`~libertem.api.Context.export_dataset` method:
+
+.. code-block:: python
+
+   with lt.Context() as ctx:
+       ctx.export_dataset(dataset, './output_path.npy')
+
+
+As of this time only exporting to the :code:`npy` format is supported, but other formats would be
+possible as the need arose.
+
+Alternatively, you can create Dask arrays from LiberTEM datasets via the :ref:`Dask integration <daskarray>`.
+These arrays can then be stored with
+`Dask's built-in functions <https://docs.dask.org/en/stable/array-creation.html#store-dask-arrays>`_
+or through additional libraries such as `RosettaSciIO <https://rosettasciio.readthedocs.io/en/latest/index.html>`_.

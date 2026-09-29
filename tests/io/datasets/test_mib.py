@@ -1,8 +1,10 @@
 import os
+import pathlib
 import sys
 import json
 from unittest import mock
 import random
+import warnings
 
 import numpy as np
 import pytest
@@ -21,9 +23,9 @@ from libertem.io.dataset.base import (
 from utils import dataset_correction_verification, get_testdata_path, ValidationUDF, roi_as_sparse
 
 try:
-    import pyxem
+    import rsciio
 except ModuleNotFoundError:
-    pyxem = None
+    rsciio = None
 
 
 MIB_TESTDATA_PATH = os.path.join(get_testdata_path(), 'default.mib')
@@ -40,8 +42,8 @@ def default_mib(lt_ctx):
         path=MIB_TESTDATA_PATH,
         nav_shape=nav_shape,
         io_backend=MMapBackend(),
+        num_partitions=4,
     )
-    ds.set_num_cores(4)
     return ds
 
 
@@ -53,8 +55,8 @@ def default_mib_readahead(lt_ctx):
         path=MIB_TESTDATA_PATH,
         nav_shape=nav_shape,
         io_backend=MMapBackend(enable_readahead_hints=True),
+        num_partitions=4,
     )
-    ds.set_num_cores(4)
     return ds
 
 
@@ -84,10 +86,10 @@ def direct_mib(lt_ctx):
 
 @pytest.fixture(scope='module')
 def default_mib_raw():
-    data = pyxem.utils.io_utils.load_mib(MIB_TESTDATA_PATH)
+    from rsciio.quantumdetector import load_mib_data
+    data = load_mib_data(MIB_TESTDATA_PATH, lazy=True)
     shape = (32, 32, 256, 256)
-    # pyxem always opens lazy, therefore compute()
-    return data.data.reshape(shape).compute()
+    return data.reshape(shape)
 
 
 def test_glob(tmp_path, naughty_filename):
@@ -132,9 +134,9 @@ def test_positive_sync_offset(default_mib, lt_ctx):
     sync_offset = 2
 
     ds_with_offset = MIBDataSet(
-        path=MIB_TESTDATA_PATH, nav_shape=(32, 32), sync_offset=sync_offset
+        path=MIB_TESTDATA_PATH, nav_shape=(32, 32), sync_offset=sync_offset,
+        num_partitions=4,
     )
-    ds_with_offset.set_num_cores(4)
     ds_with_offset = ds_with_offset.initialize(lt_ctx.executor)
     ds_with_offset.check_valid()
 
@@ -151,8 +153,11 @@ def test_positive_sync_offset(default_mib, lt_ctx):
         dataset_shape=ds_with_offset.shape,
     )
 
-    t0 = next(p0.get_tiles(tiling_scheme))
+    tiles = p0.get_tiles(tiling_scheme)
+    t0 = next(tiles)
     assert tuple(t0.tile_slice.origin) == (0, 0, 0)
+    for t in tiles:
+        pass
 
     for p in ds_with_offset.get_partitions():
         for t in p.get_tiles(tiling_scheme=tiling_scheme):
@@ -178,9 +183,9 @@ def test_negative_sync_offset(default_mib, lt_ctx):
     sync_offset = -2
 
     ds_with_offset = MIBDataSet(
-        path=MIB_TESTDATA_PATH, nav_shape=(32, 32), sync_offset=sync_offset
+        path=MIB_TESTDATA_PATH, nav_shape=(32, 32), sync_offset=sync_offset,
+        num_partitions=4,
     )
-    ds_with_offset.set_num_cores(4)
     ds_with_offset = ds_with_offset.initialize(lt_ctx.executor)
     ds_with_offset.check_valid()
 
@@ -197,8 +202,11 @@ def test_negative_sync_offset(default_mib, lt_ctx):
         dataset_shape=ds_with_offset.shape,
     )
 
-    t0 = next(p0.get_tiles(tiling_scheme))
+    tiles = p0.get_tiles(tiling_scheme)
+    t0 = next(tiles)
     assert tuple(t0.tile_slice.origin) == (2, 0, 0)
+    for t in tiles:
+        pass
 
     for p in ds_with_offset.get_partitions():
         for t in p.get_tiles(tiling_scheme=tiling_scheme):
@@ -271,6 +279,8 @@ def test_read(default_mib):
     t = next(tiles)
     # we get 3D tiles here, because MIB partitions are inherently 3D
     assert tuple(t.tile_slice.shape) == (3, 256, 256)
+    for _ in tiles:
+        pass
 
 
 @needsdata
@@ -293,6 +303,8 @@ def test_scheme_too_large(default_mib):
     tiles = p.get_tiles(tiling_scheme=tiling_scheme)
     t = next(tiles)
     assert tuple(t.tile_slice.shape) == tuple((depth,) + default_mib.shape.sig)
+    for _ in tiles:
+        pass
 
 
 @needsdata
@@ -316,10 +328,12 @@ def test_read_ahead(default_mib_readahead):
     t = next(tiles)
     # we get 3D tiles here, because MIB partitions are inherently 3D
     assert tuple(t.tile_slice.shape) == (3, 256, 256)
+    for _ in tiles:
+        pass
 
 
 @needsdata
-@pytest.mark.skipif(pyxem is None, reason="No PyXem found")
+@pytest.mark.skipif(rsciio is None, reason="No rosettasciio found")
 def test_comparison(default_mib, default_mib_raw, lt_ctx_fast):
     udf = ValidationUDF(
         reference=reshaped_view(default_mib_raw, (-1, *tuple(default_mib.shape.sig)))
@@ -328,7 +342,7 @@ def test_comparison(default_mib, default_mib_raw, lt_ctx_fast):
 
 
 @needsdata
-@pytest.mark.skipif(pyxem is None, reason="No PyXem found")
+@pytest.mark.skipif(rsciio is None, reason="No rosettasciio found")
 def test_comparison_roi(default_mib, default_mib_raw, lt_ctx_fast):
     roi = np.random.choice(
         [True, False],
@@ -456,10 +470,9 @@ def test_not_too_many_files(lt_ctx):
             "/a/%d.mib" % i
             for i in range(256)
     ]):
-        with pytest.warns(None) as record:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             ds._filenames()
-
-    assert len(record) == 0
 
 
 @needsdata
@@ -567,3 +580,48 @@ def test_compare_backends_sparse(lt_ctx, default_mib, buffered_mib, as_sparse):
     buffered_f0 = lt_ctx.run_udf(dataset=buffered_mib, udf=PickUDF(), roi=roi)['intensity']
 
     assert np.allclose(mm_f0, buffered_f0)
+
+
+@needsdata
+@pytest.mark.slow
+def test_run_many_files(lt_ctx):
+    # import tarfile
+    # archive = pathlib.Path(MIB_TESTDATA_PATH).parent / 'many_mib.tar.gz'
+    # outdir = pathlib.Path(tmpdir_factory.mktemp('many_mib_files'))
+
+    # with tarfile.open(archive, mode='r:gz') as tp:
+    #     tp.extractall(path=outdir)
+
+    out_dir = pathlib.Path(MIB_TESTDATA_PATH).parent / 'many_mib'
+    hdr_path = out_dir / 'w_140 h_139-2map.hdr'
+    nav_shape = (139, 141)
+    lt_ctx.load('mib', path=hdr_path, nav_shape=nav_shape)
+
+
+def test_bad_params(ds_params_tester, standard_bad_ds_params):
+    args = ("mib", MIB_TESTDATA_PATH)
+    for params in standard_bad_ds_params:
+        if 'nav_shape' not in params:
+            params['nav_shape'] = (1, 1)
+        ds_params_tester(*args, **params)
+
+
+@needsdata
+def test_read_scan_shape_header(lt_ctx):
+    out_dir = pathlib.Path(MIB_TESTDATA_PATH).parent / 'merlin_scan_header/'
+    hdr_path = (
+        out_dir / 't2_200kV_alpha3_28_20_px_5_4nm_300k_C2_30um_CL_10m_1ms_1L_with_flatfield.hdr'
+    )
+    ds = lt_ctx.load('mib', path=hdr_path)
+    assert ds.shape.nav.to_tuple() == (20, 28)
+    assert ds.shape.sig.to_tuple() == (514, 514)
+
+
+@needsdata
+def test_no_num_partitions(lt_ctx):
+    ds = lt_ctx.load(
+        "mib",
+        path=MIB_TESTDATA_PATH,
+        nav_shape=(32, 32),
+    )
+    lt_ctx.run_udf(dataset=ds, udf=SumSigUDF())

@@ -61,8 +61,6 @@ def detect_pyfftw():
 
 @contextmanager
 def set_fftw_threads(n):
-    global __has_pyfftw
-    global __has_pyfftw_threads
     global __pyfftw_counter
     global __pyfftw_threads
 
@@ -100,7 +98,6 @@ def detect_pytorch():
 
 @contextmanager
 def set_torch_threads(n):
-    global __has_pytorch
     global __pytorch_counter
     global __pytorch_threads
 
@@ -195,35 +192,49 @@ class ThreadpoolWrapper:
 
 
 @contextmanager
-def set_num_threads(n):
-    # Make sure modules that use BLAS are loaded
-    import scipy  # noqa: F401
-    import numpy as np  # noqa: F401
-    global __threadpool_wrapper
-    global __threadpool_counter
-    global __threadpool_limiter
+def set_num_threads(n: int | None):
+    '''
+    Set number of threads in various numerics libraries.
 
-    with lock:
-        if __threadpool_wrapper is None:
-            __threadpool_wrapper = ThreadpoolWrapper()
-    # We use __threadpool_wrapper last so that it can cover
-    # libraries that the other ones load
-    with set_fftw_threads(n):
-        with set_torch_threads(n):
-            with set_numba_threads(n):
-                try:
-                    with lock:
-                        if __threadpool_counter == 0:
-                            # The limit is set upon calling ThreadpoolController.limit()
-                            __threadpool_limiter = __threadpool_wrapper(n)
-                        __threadpool_counter += 1
-                    yield
-                finally:
-                    with lock:
-                        __threadpool_counter -= 1
-                        if __threadpool_counter == 0 and __threadpool_limiter is not None:
-                            __threadpool_limiter.restore_original_limits()
-                            __threadpool_limiter = None
+    Parameters
+    ----------
+
+    n : int or None
+        If set to None, don't set thread count.
+        This allows conditionally setting the thread count without
+        changing the code structure.
+    '''
+    if n is None:
+        yield
+    else:
+        # Make sure modules that use BLAS are loaded
+        import scipy  # noqa: F401
+        import numpy as np  # noqa: F401
+        global __threadpool_wrapper
+        global __threadpool_counter
+        global __threadpool_limiter
+
+        with lock:
+            if __threadpool_wrapper is None:
+                __threadpool_wrapper = ThreadpoolWrapper()
+        # We use __threadpool_wrapper last so that it can cover
+        # libraries that the other ones load
+        with set_fftw_threads(n):
+            with set_torch_threads(n):
+                with set_numba_threads(n):
+                    try:
+                        with lock:
+                            if __threadpool_counter == 0:
+                                # The limit is set upon calling ThreadpoolController.limit()
+                                __threadpool_limiter = __threadpool_wrapper(n)
+                            __threadpool_counter += 1
+                        yield
+                    finally:
+                        with lock:
+                            __threadpool_counter -= 1
+                            if __threadpool_counter == 0 and __threadpool_limiter is not None:
+                                __threadpool_limiter.restore_original_limits()
+                                __threadpool_limiter = None
 
 
 @contextmanager
@@ -281,8 +292,6 @@ def mitigations():
     * Disable pyFFTW interface cache:
       https://github.com/LiberTEM/LiberTEM-blobfinder/issues/35
     '''
-    global __has_pyfftw
-    global __has_pyfftw_threads
     global __mitigation_counter
     global __pyfftw_cached
 

@@ -1,15 +1,17 @@
 import math
 import logging
 import warnings
-from typing import List, TYPE_CHECKING, Optional, Tuple, Union, Sequence
-from typing_extensions import Literal
+from typing import TYPE_CHECKING, Union
+from collections.abc import Sequence
+from typing import Literal
 
 import numpy as np
 
+from libertem.common.exceptions import UDFException
 from libertem.io.corrections import CorrectionSet
 from libertem.common import Shape, Slice
 from libertem.common.math import prod
-from libertem.common.udf import UDFProtocol
+from libertem.common.udf import UDFProtocol, UDFMethod
 
 if TYPE_CHECKING:
     from numpy import typing as nt
@@ -22,8 +24,8 @@ TilingIntent = Union[Literal["partition"], Literal["frame"], Literal["tile"]]
 
 class TilingScheme:
     def __init__(
-        self, slices: List[Slice],
-        tileshape: Shape, dataset_shape: Shape, intent: Optional[TilingIntent] = None, debug=None
+        self, slices: list[Slice],
+        tileshape: Shape, dataset_shape: Shape, intent: TilingIntent | None = None, debug=None
     ):
         self._slices = slices
         self._tileshape = tileshape
@@ -71,7 +73,7 @@ class TilingScheme:
         cls,
         tileshape: Shape,
         dataset_shape: Shape,
-        intent: Optional[TilingIntent] = None,
+        intent: TilingIntent | None = None,
         debug=None,
     ) -> "TilingScheme":
         """
@@ -128,7 +130,7 @@ class TilingScheme:
         )
 
     @property
-    def intent(self) -> Optional[TilingIntent]:
+    def intent(self) -> TilingIntent | None:
         return self._intent
 
     @property
@@ -178,13 +180,13 @@ class Negotiator:
 
     def validate(
         self,
-        shape: Tuple[int, ...],
-        ds_sig_shape: Tuple[int, ...],
+        shape: tuple[int, ...],
+        ds_sig_shape: tuple[int, ...],
         size: int,
         io_max_size: int,
         itemsize: int,
-        base_shape: Tuple[int, ...],
-        corrections: Optional[CorrectionSet],
+        base_shape: tuple[int, ...],
+        corrections: CorrectionSet | None,
     ):
         sig_shape = shape[1:]
         # we need some wiggle room with the size, because there may be a harder
@@ -224,8 +226,8 @@ class Negotiator:
             dataset,
             read_dtype: "nt.DTypeLike",
             approx_partition_shape: Shape,
-            roi: Optional[np.ndarray] = None,
-            corrections: Optional[CorrectionSet] = None,
+            roi: np.ndarray | None = None,
+            corrections: CorrectionSet | None = None,
     ) -> TilingScheme:
         """
         Generate a :class:`TilingScheme` instance that is
@@ -442,24 +444,17 @@ class Negotiator:
         return size
 
     def _get_intent(self, udfs: Sequence[UDFProtocol]) -> TilingIntent:
-        intent: Optional[TilingIntent] = None
-        if any(
-            udf.get_method() == "tile"
-            for udf in udfs
-        ):
-            intent = "tile"
-        if any(
-            udf.get_method() == "frame"
-            for udf in udfs
-        ):
-            intent = "frame"
-        if any(
-            udf.get_method() == "partition"
-            for udf in udfs
-        ):
-            intent = "partition"
-        assert intent is not None
-        return intent
+        udf_methods = tuple(udf.get_method() for udf in udfs)
+        if any(m not in tuple(UDFMethod) for m in udf_methods):
+            raise UDFException('A UDF declared an invalid processing method')
+        if UDFMethod.PARTITION in udf_methods:
+            return "partition"
+        elif UDFMethod.FRAME in udf_methods:
+            return "frame"
+        elif UDFMethod.TILE in udf_methods:
+            return "tile"
+        else:
+            raise ValueError('No recognized UDF method, empty udfs arg?')
 
     def _get_size(
             self, io_max_size, udf: UDFProtocol, itemsize,
@@ -470,11 +465,11 @@ class Negotiator:
         udf_method = udf.get_method()
         partition_size = itemsize * prod(tuple(approx_partition_shape))
         partition_size_sig = itemsize * prod(tuple(approx_partition_shape.sig))
-        if udf_method == "frame":
+        if udf_method == UDFMethod.FRAME:
             size = max(self._get_default_size(), partition_size_sig)
-        elif udf_method == "partition":
+        elif udf_method == UDFMethod.PARTITION:
             size = partition_size
-        elif udf_method == "tile":
+        elif udf_method == UDFMethod.TILE:
             # start with the UDF size preference:
             size = self._get_udf_size_pref(udf)
 
@@ -485,6 +480,9 @@ class Negotiator:
             # we need to increase the size:
             base_size = itemsize * prod(base_shape)
             size = max(base_size, size)
+        else:  # pragma: no cover
+            # Should never be reached, this is checked earlier in UDFRunner
+            raise UDFException(f'UDF.get_method() returned unrecognized method: {udf_method}')
         return size
 
     def _get_base_shape(
@@ -492,13 +490,13 @@ class Negotiator:
         udfs: Sequence["UDFProtocol"],
         dataset: "DataSet",
         approx_partition_shape: Shape,
-        roi: Optional[np.ndarray],
+        roi: np.ndarray | None,
     ):
         methods = [
             udf.get_method()
             for udf in udfs
         ]
-        if any(m == "frame" or m == "partition" for m in methods):
+        if any(m in (UDFMethod.FRAME, UDFMethod.PARTITION) for m in methods):
             base_shape = approx_partition_shape.sig
         else:
             # only by tile:
@@ -520,8 +518,8 @@ class Negotiator:
     def _get_min_depth(self, udf: "UDFProtocol", approx_partition_shape: Shape) -> int:
         udf_method = udf.get_method()
 
-        if udf_method == "partition":
+        if udf_method == UDFMethod.PARTITION:
             return approx_partition_shape[0]
-        elif udf_method == "tile":
+        elif udf_method == UDFMethod.TILE:
             return self._get_udf_depth_pref(udf, approx_partition_shape)
         return 1

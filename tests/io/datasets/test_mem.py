@@ -8,9 +8,10 @@ from libertem.udf.stddev import StdDevUDF
 from libertem.io.dataset.memory import MemoryDataSet
 from libertem.utils.devices import detect
 from sparseconverter import (
-    BACKENDS, CUPY_SCIPY_CSC, NUMPY, SCIPY_CSR, SPARSE_COO, SPARSE_GCXS,
+    CUPY_SCIPY_CSC, NUMPY, SCIPY_CSR, SPARSE_COO, SPARSE_GCXS,
     CUPY, get_backend, get_device_class
 )
+from libertem.udf.base import UDFProtocol
 
 from utils import _mk_random, dataset_correction_verification, set_device_class, roi_as_sparse
 
@@ -20,7 +21,7 @@ has_cupy = d['cudas'] and d['has_cupy']
 
 
 @pytest.mark.parametrize(
-    'backend', (None, ) + tuple(BACKENDS)
+    'backend', (None, ) + tuple(UDFProtocol.BACKEND_ALL)
 )
 def test_get_macrotile(backend):
     with set_device_class(get_device_class(backend)):
@@ -383,3 +384,13 @@ def test_sig_nav_dims_sync(nav_shape, sig_shape, sync_offset, sig_dims, prime_ra
 def test_exception_no_datashape(lt_ctx_fast):
     with pytest.raises(DataSetException):
         lt_ctx_fast.load('memory', tileshape=(5, 6, 7))
+
+
+def test_num_partitions(lt_ctx):
+    data = _mk_random(size=(8, 8, 8, 8))
+    ds = lt_ctx.load(
+        "memory",
+        num_partitions=7,
+        data=data,
+    )
+    assert len(list(ds.get_partitions())) == 7

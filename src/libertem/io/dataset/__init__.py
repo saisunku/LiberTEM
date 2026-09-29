@@ -1,10 +1,10 @@
 import typing
-from typing import Dict, List, Union, Any
+from typing import Any
 import pathlib
 from functools import lru_cache
 import importlib
 import warnings
-from typing_extensions import Literal
+from typing import Literal
 import numpy as np
 
 from libertem.io.dataset.base import DataSetException, DataSet
@@ -32,8 +32,8 @@ filetypes = {
 }
 
 
-@lru_cache()
-def build_extension_map() -> Dict[str, List[str]]:
+@lru_cache
+def build_extension_map() -> dict[str, list[str]]:
     ext_map = {}
     for typ_ in filetypes:
         cls = get_dataset_cls(typ_)
@@ -62,7 +62,7 @@ def _auto_load(
 @typing.overload
 def _auto_load(
     path: str, enable_async: bool, *args, executor, **kwargs,
-) -> typing.Union[DataSet, typing.Awaitable[DataSet]]:
+) -> DataSet | typing.Awaitable[DataSet]:
     ...
 
 
@@ -72,7 +72,7 @@ def _auto_load(path, *args, executor, **kwargs):
             "please specify the `path` argument to allow auto detection"
         )
     detected_params = detect(path, executor=executor)
-    filetype_detected: typing.Optional[str] = detected_params.get('type', None)
+    filetype_detected: str | None = detected_params.get('type', None)
     if filetype_detected is None:
         raise DataSetException(
             "could not determine DataSet type for file '%s'" % path,
@@ -99,7 +99,7 @@ def load(
 @typing.overload
 def load(
     filetype: str, *args, enable_async: bool, executor, **kwargs,
-) -> typing.Union[DataSet, typing.Awaitable[DataSet]]:
+) -> DataSet | typing.Awaitable[DataSet]:
     ...
 
 
@@ -165,7 +165,7 @@ def unregister_dataset_cls(filetype: str) -> None:
     del filetypes[filetype]
 
 
-def get_dataset_cls(filetype: str) -> typing.Type[DataSet]:
+def get_dataset_cls(filetype: str) -> type[DataSet]:
     if not isinstance(filetype, str):
         return filetype
     try:
@@ -181,11 +181,11 @@ def get_dataset_cls(filetype: str) -> typing.Type[DataSet]:
         module = importlib.import_module(module_name)
     except ImportError as e:
         raise DataSetException("could not load dataset: %s" % str(e))
-    cls: typing.Type[DataSet] = getattr(module, cls_name)
+    cls: type[DataSet] = getattr(module, cls_name)
     return cls
 
 
-def get_search_order(path: Union[str, np.ndarray]) -> List[str]:
+def get_search_order(path: str | np.ndarray) -> list[str]:
     """
     Return the keys from filetypes in an order which
     is perhaps optimal for dataset auto-detection
@@ -220,7 +220,7 @@ def get_search_order(path: Union[str, np.ndarray]) -> List[str]:
     return search_order
 
 
-def detect(path: Union[str, np.ndarray], executor) -> Dict[str, Any]:
+def detect(path: str | np.ndarray, executor) -> dict[str, Any]:
     """
     Returns dataset's detected type, parameters and
     additional info.
@@ -239,13 +239,13 @@ def detect(path: Union[str, np.ndarray], executor) -> Dict[str, Any]:
     return {}
 
 
-def get_extensions() -> typing.Set[str]:
+def get_extensions() -> set[str]:
     """
     Return supported extensions as a set of strings.
 
     Plain extensions only, no pattern!
     """
-    types: typing.Set[str] = set()
+    types: set[str] = set()
     for filetype in filetypes.keys():
         cls = get_dataset_cls(filetype)
         types = types.union({ext.lower() for ext in cls.get_supported_extensions()})

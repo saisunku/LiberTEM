@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+import platform
 
 
 '''
@@ -19,7 +19,7 @@ where an :class:`~libertem.executor.inline.InlineJobExecutor` runs tasks.
 '''
 
 
-def get_use_cuda() -> Optional[int]:
+def get_use_cuda() -> int | None:
     '''
     .. versionadded:: 0.6.0
 
@@ -29,7 +29,12 @@ def get_use_cuda() -> Optional[int]:
         CUDA device ID to use.
     '''
     ret = os.environ.get("LIBERTEM_USE_CUDA")
+    opp = os.environ.get("LIBERTEM_USE_CPU")
     if ret is not None:
+        if opp is not None:
+            raise RuntimeError(
+                "Both LIBERTEM_USE_CPU and LIBERTEM_USE_CUDA set, expecting at most one"
+            )
         return int(ret)
     else:
         return None
@@ -62,7 +67,12 @@ def get_use_cpu():
         Default is 0 if no settings were applied before.
     '''
     ret = os.environ.get("LIBERTEM_USE_CPU")
+    opp = os.environ.get("LIBERTEM_USE_CUDA")
     if ret is not None:
+        if opp is not None:
+            raise RuntimeError(
+                "Both LIBERTEM_USE_CPU and LIBERTEM_USE_CUDA set, expecting at most one"
+            )
         ret = int(ret)
     elif get_use_cuda() is None:
         # If no variable is set, return CPU 0
@@ -106,3 +116,13 @@ def get_device_class():
         return "cuda"
     else:
         return "cpu"
+
+
+def set_file_limit():
+    if platform.system() == "Windows":
+        # Windows has no problem opening huge numbers of files
+        return
+
+    import resource
+    _, hard_lim = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard_lim, hard_lim))

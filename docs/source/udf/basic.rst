@@ -489,9 +489,41 @@ than making two passes over the whole :code:`DataSet`:
 
    from libertem.udf.sum import SumUDF
 
-   # results are returned as a tuple, so we can unpack them here into
-   # `res` and `res_sum`:
+   # results are returned as a list of dictionaries, so we can unpack them here
+   # into `res` and `res_sum`:
    res, res_sum = ctx.run_udf(udf=[udf, SumUDF()], dataset=dataset)
+
+
+Note the return type: if you pass a list of UDFs, you also get a list of
+dictionaries as a result, with the ordering of results matching the ordering of
+UDFs in the :meth:`~libertem.api.Context.run_udf` call.
+
+
+.. _`udf cancellation`:
+
+Cancellation
+~~~~~~~~~~~~
+
+.. versionadded:: 0.12.0
+
+Especially when running UDFs on live data streams, it can happen that a UDF
+doesn't run to completion. An example scenario is when a continuously running
+preview scan is stopped, or scan parameters are changed while the scan is
+running.
+
+In this case, the exception
+:class:`~libertem.common.exceptions.UDFRunCancelled` is raised, which you can
+handle in an appropriate way for your application:
+
+.. testcode:: run
+
+   from libertem.common.exceptions import UDFRunCancelled
+
+   try:
+       res = ctx.run_udf(udf=udf, dataset=dataset)
+   except UDFRunCancelled:
+       # handle cancellation, for example, start the next UDF run
+       pass
 
 
 .. _`udf roi`:
@@ -510,9 +542,9 @@ run your UDF on a selected subset of data. :code:`roi` can be specified in sever
   This allows quick specification of a small number of pixels to include or exclude
   from the analysis.
 - a NumPy array containing a bool mask, having the shape of the navigation
-  axes of the dataset.
+  axes of the dataset. This can also be created from a slice using :attr:`~libertem.io.dataset.DataSet.roi`.
 - any :code:`scipy.sparse` matrix or array or :code:`pydata.sparse.SparseArray` format,
-  again having the same shape as the naivgation axes of the dataset
+  again having the same shape as the navigation axes of the dataset
 
 For example, to process a random subset of a 4D-STEM dataset:
    
@@ -524,6 +556,13 @@ For example, to process a random subset of a 4D-STEM dataset:
    # and two navigation dimensions, `dataset.shape.nav`
    # translates to `(14, 14)`.
    roi = np.random.choice(a=[False, True], size=dataset.shape.nav)
+   ctx.run_udf(udf=udf, dataset=dataset, roi=roi)
+
+Or, to select a specific slice:
+
+.. testcode:: run
+
+   roi = dataset.roi[3:7, 9:12]
    ctx.run_udf(udf=udf, dataset=dataset, roi=roi)
 
 Note that the result array only contains values for the selected indices, all
@@ -595,6 +634,11 @@ that leads to undefined behavior. In particular, nested or concurrent execution
 of the same UDF objects must be avoided since it modifies the buffers that are
 allocated internally while a UDF is running.
 
+With :meth:`~libertem.api.Context.run_udf_iter`, for performance reasons, the
+:meth:`~libertem.udf.base.UDF.get_results` method will only be called when
+accessing the :code:`.buffers` attribute. Make sure there are no side effects
+that you rely on!
+
 Asynchronous execution
 ----------------------
 
@@ -612,6 +656,11 @@ passing :code:`sync=False` to :meth:`~libertem.api.Context.run_udf_iter` or
 
     # or the version without intermediate results:
     udf_results = await ctx.run_udf(dataset=dataset, udf=udf, sync=False)
+
+Note that, in case you are using the async mode of
+:meth:`~libertem.api.Context.run_udf_iter`, a copy of the results will be
+performed on accessing the :code:`buffers` attribute, to make sure that
+concurrent access does not result in inconsistent views of results.
 
 See the items below for a more comprehensive demonstration and documentation:
 

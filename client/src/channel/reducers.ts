@@ -8,6 +8,8 @@ export interface ChannelStatusReducer {
 export enum ChannelStatusCodes {
     CONNECTING = "connecting",
     CONNECTED = "connected",
+    SNOOZED = "snoozed",
+    UNSNOOZING = "unsnoozing",
     READY = "ready",
     WAITING = "waiting",
     DISCONNECTED = "disconnected"
@@ -28,6 +30,15 @@ export const channelStatusReducer = (state = initialChannelState, action: AllAct
         case channelActions.ActionTypes.CLOSE: {
             return { status: ChannelStatusCodes.WAITING };
         }
+        case channelActions.ActionTypes.SNOOZE: {
+            return { status: ChannelStatusCodes.SNOOZED };
+        }
+        case channelActions.ActionTypes.UNSNOOZE: {
+            return { status: ChannelStatusCodes.UNSNOOZING };
+        }
+        case channelActions.ActionTypes.UNSNOOZE_DONE: {
+            return { status: ChannelStatusCodes.READY };
+        }        
         case channelActions.ActionTypes.SHUTDOWN: {
             return { status: ChannelStatusCodes.DISCONNECTED }
         }

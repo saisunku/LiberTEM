@@ -1,8 +1,7 @@
-from typing import Iterable, Union, Tuple
+from typing import Union
+from collections.abc import Iterable
 
 import numpy as np
-
-from .sparse import assert_sparse
 
 
 _prod_accepted = (
@@ -35,20 +34,17 @@ def prod(iterable: Iterable[ProdAccepted]):
 
 
 def count_nonzero(array) -> int:
-    nnz: int  # for mypy
     try:
-        nnz = np.count_nonzero(array)
-    except TypeError:
-        sparse_a = assert_sparse(array)
-        nnz = sparse_a.nnz
-    return nnz
+        return int(np.count_nonzero(array))
+    except (TypeError, ValueError):
+        return int(array.astype(bool).sum())
 
 
 def flat_nonzero(array):
     return array.flatten().nonzero()[0]
 
 
-def make_2D_square(shape: Tuple[int, ...]) -> Tuple[int, ...]:
+def make_2D_square(shape: tuple[int, ...]) -> tuple[int, ...]:
     """
     Convert the 1D shape tuple into a square 2D shape tuple
     if the size of shape is a square number

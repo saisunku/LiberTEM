@@ -2,7 +2,6 @@ import os
 import re
 import csv
 from glob import glob, escape
-import typing
 import logging
 import warnings
 import configparser
@@ -165,7 +164,7 @@ def _read_file_header(path):
     header_raw = np.fromfile(path, dtype=file_header_dtype, count=1)
     header = {}
     for field, dtype in file_header_dtype:
-        if type(dtype) != str:
+        if type(dtype) is not str:
             continue
         header[field] = header_raw[field][0]
         # to prevent overflows in following computations:
@@ -381,7 +380,7 @@ class FRMS6FileSet(FileSet):
     def get_read_ranges(
         self, start_at_frame: int, stop_before_frame: int,
         dtype, tiling_scheme: TilingScheme, sync_offset: int = 0,
-        roi: typing.Union[np.ndarray, None] = None,
+        roi: np.ndarray | None = None,
     ):
         fileset_arr = self.get_as_arr()
         binning = self._global_header['readoutmode']['bin']
@@ -433,11 +432,35 @@ class FRMS6DataSet(DataSet):
     sync_offset: int, optional
         If positive, number of frames to skip from start
         If negative, number of blank frames to insert at start
+
+    num_partitions: int, optional
+        Override the number of partitions. This is useful if the
+        default number of partitions, chosen based on common workloads,
+        creates partitions which are too large (or small) for the UDFs
+        being run on this dataset.
+
+    Examples
+    --------
+
+    >>> ds = ctx.load("frms6", path='./path_to_file.hdr', ...)  # doctest: +SKIP
     """
 
-    def __init__(self, path, enable_offset_correction=True, gain_map_path=None, dest_dtype=None,
-                 nav_shape=None, sig_shape=None, sync_offset=0, io_backend=None):
-        super().__init__(io_backend=io_backend)
+    def __init__(
+        self,
+        path,
+        enable_offset_correction=True,
+        gain_map_path=None,
+        dest_dtype=None,
+        nav_shape=None,
+        sig_shape=None,
+        sync_offset=0,
+        io_backend=None,
+        num_partitions=None,
+    ):
+        super().__init__(
+            io_backend=io_backend,
+            num_partitions=num_partitions,
+        )
         self._path = path
         self._gain_map_path = gain_map_path
         self._dark_frame = None

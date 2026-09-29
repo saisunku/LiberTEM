@@ -9,6 +9,8 @@ Context
 .. automodule:: libertem.api
    :members:
 
+.. autoclass:: libertem.common.exceptions.ExecutorSpecException
+
 Analysis API
 ~~~~~~~~~~~~
 
@@ -19,7 +21,7 @@ Analysis API
    :members: MasksResultSet, SingleMaskResultSet
 
 .. automodule:: libertem.analysis.com
-   :members: COMResultSet, guess_corrections, GuessResult
+   :members: COMResultSet
 
 .. automodule:: libertem.analysis.sum
    :members: SumResultSet

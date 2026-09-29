@@ -1,16 +1,17 @@
 import asyncio
+import sys
 import os
 import importlib.util
 import platform
 import threading
-from typing import Tuple
-import pkg_resources
 from functools import partial
 import warnings
 import contextlib
 import socket
 import logging
+import textwrap
 
+from importlib.metadata import distributions
 import numpy as np
 import pytest
 import h5py
@@ -26,6 +27,7 @@ import tornado.httpserver
 import libertem.api as lt
 from libertem.executor.inline import InlineJobExecutor
 from libertem.executor.delayed import DelayedJobExecutor
+from libertem.io.dataset import get_dataset_cls
 from libertem.io.dataset.hdf5 import H5DataSet
 from libertem.io.dataset.raw import RawFileDataSet
 from libertem.io.dataset.memory import MemoryDataSet
@@ -38,7 +40,8 @@ from libertem.viz.base import Dummy2DPlot
 from libertem.utils.devices import detect
 
 from libertem.web.server import make_app, EventRegistry
-from libertem.web.state import SharedState
+from libertem.web.state import SharedState, ExecutorState
+from libertem.web.event_bus import EventBus
 from libertem.executor.base import AsyncAdapter
 from libertem.common.async_utils import sync_to_async
 from libertem.common.async_utils import adjust_event_loop_policy
@@ -58,6 +61,13 @@ spec.loader.exec_module(utils)
 
 # Mitigation for https://github.com/dask/distributed/issues/6776
 dask.config.set({"distributed.worker.profile.enabled": False})
+
+
+d = detect()
+if d['has_cupy'] and d['cudas']:
+    main_process_gpu = d['cudas'][0]
+else:
+    main_process_gpu = None
 
 
 def get_or_create_hdf5(tmpdir_factory, filename, *args, **kwargs):
@@ -122,7 +132,7 @@ def empty_hdf5(tmpdir_factory):
 
 @pytest.fixture(scope='session')
 def hdf5_4d_data():
-    data = np.random.randn(2, 10, 26, 26).astype("float32")
+    data = np.random.random((2, 10, 26, 26)).astype("float32")
     yield data
 
 
@@ -239,15 +249,20 @@ def default_raw_data():
 
 
 @pytest.fixture(scope='session')
-def default_raw(tmpdir_factory, default_raw_data):
-    lt_ctx = lt.Context(executor=InlineJobExecutor())
+def default_raw_file(tmpdir_factory, default_raw_data):
     datadir = tmpdir_factory.mktemp('data')
     filename = datadir + '/raw-test-default'
     default_raw_data.tofile(str(filename))
     del default_raw_data
+    return filename
+
+
+@pytest.fixture(scope='session')
+def default_raw(default_raw_file):
+    lt_ctx = lt.Context(executor=InlineJobExecutor())
     ds = lt_ctx.load(
         "raw",
-        path=str(filename),
+        path=str(default_raw_file),
         dtype="float32",
         nav_shape=(16, 16),
         sig_shape=(128, 128),
@@ -526,7 +541,7 @@ def mock_sparse_data():
 
 
 @pytest.fixture(scope="session")
-def raw_csr_generated(mock_sparse_data: Tuple[csr_matrix, np.ndarray], tmpdir_factory):
+def raw_csr_generated(mock_sparse_data: tuple[csr_matrix, np.ndarray], tmpdir_factory):
     orig, data_flat = mock_sparse_data
     datadir = tmpdir_factory.mktemp('raw_csr')
     name_indptr = str(datadir / 'indptr.raw')
@@ -559,7 +574,7 @@ data_dtype = "{str(orig.data.dtype)}"
 
 @pytest.fixture(scope="session")
 def raw_csr_generated_bigendian(
-        mock_sparse_data: Tuple[csr_matrix, np.ndarray], tmpdir_factory):
+        mock_sparse_data: tuple[csr_matrix, np.ndarray], tmpdir_factory):
     orig, data_flat = mock_sparse_data
     dtype = np.dtype('>i4')
     datadir = tmpdir_factory.mktemp('raw_csr')
@@ -587,6 +602,38 @@ data_dtype = "{str(dtype)}"
     orig.indptr.astype(dtype).tofile(name_indptr)
     orig.indices.astype(dtype).tofile(name_coords)
     orig.data.astype(dtype).tofile(name_values)
+    lt_ctx = lt.Context.make_with('inline')
+    yield lt_ctx.load("raw_csr", path=name_sidecar)
+
+
+@pytest.fixture(scope="session")
+def raw_csr_generated_uint64(mock_sparse_data: tuple[csr_matrix, np.ndarray], tmpdir_factory):
+    orig, data_flat = mock_sparse_data
+    datadir = tmpdir_factory.mktemp('raw_csr')
+    name_indptr = str(datadir / 'indptr_uint64.raw')
+    name_coords = str(datadir / 'coords_uint64.raw')
+    name_values = str(datadir / 'values_uint64.raw')
+    name_sidecar = str(datadir / 'sparse_uint64.toml')
+    with open(name_sidecar, "w") as f:
+        f.write("""
+[params]
+filetype = "raw_csr"
+nav_shape = [13, 17]
+sig_shape = [24, 19]
+
+[raw_csr]
+indptr_file = "indptr_uint64.raw"
+indptr_dtype = "<u8"
+
+indices_file = "coords_uint64.raw"
+indices_dtype = "<u8"
+
+data_file = "values_uint64.raw"
+data_dtype = "<u8"
+""")
+    orig.indptr.astype("<u8").tofile(name_indptr)
+    orig.indices.astype("<u8").tofile(name_coords)
+    orig.data.astype("<u8").tofile(name_values)
     lt_ctx = lt.Context.make_with('inline')
     yield lt_ctx.load("raw_csr", path=name_sidecar)
 
@@ -688,7 +735,7 @@ def dist_ctx(scheduler_addr):
      - one scheduler node
      - data availability TBD
     """
-    executor = DaskJobExecutor.connect(scheduler_addr)
+    executor = DaskJobExecutor.connect(scheduler_addr, main_process_gpu=main_process_gpu)
     with lt.Context(executor=executor) as ctx:
         yield ctx
 
@@ -700,7 +747,9 @@ def ipy_ctx():
     # wait for two engines: see also docker-compose.yml where the engines are started
     client.wait_for_engines(2)
     dask_client = client.become_dask()
-    executor = DaskJobExecutor(client=dask_client, is_local=False)
+    executor = DaskJobExecutor(
+        client=dask_client, is_local=False, main_process_gpu=main_process_gpu
+    )
     with lt.Context(executor=executor) as ctx:
         yield ctx
 
@@ -725,7 +774,7 @@ def ipy_ctx():
 @pytest.fixture(scope="class")
 def shared_dist_ctx():
     print("start shared Context()")
-    ctx = lt.Context()
+    ctx = lt.Context.make_with(main_process_gpu=main_process_gpu)
     yield ctx
     print("stop shared Context()")
     ctx.close()
@@ -736,7 +785,7 @@ def shared_dist_ctx_globaldask():
     # Sets default dask.distributed client
     # for integration testing
     print("start shared Context()")
-    ctx = lt.Context.make_with('dask-make-default')
+    ctx = lt.Context.make_with('dask-make-default', main_process_gpu=main_process_gpu)
     yield ctx
     print("stop shared Context()")
     # Make sure everything is shut down
@@ -745,40 +794,8 @@ def shared_dist_ctx_globaldask():
 
 
 @pytest.fixture(autouse=True)
-def fixup_event_loop():
-    import nest_asyncio
-    nest_asyncio.apply()
-    adjust_event_loop_policy()
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    """
-    We need to use a session-scoped event loop, otherwise we get
-    errors like `RuntimeError: Cannot close a running event loop`.
-    """
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    print("event loop teardown")
-    loop.run_until_complete(loop.shutdown_asyncgens())
-    if hasattr(loop, 'shutdown_default_executor'):
-        loop.run_until_complete(loop.shutdown_default_executor())
-    loop.close()
-
-    # Work around: pytest-asyncio sets an empty event loop policy here,
-    # which breaks on windows, where we have to supply a specific
-    # event loop policy. Until this is fixed in pytest-asyncio, manually re-set
-    # the event policy here.
-    # See also: https://github.com/pytest-dev/pytest-asyncio/pull/192
-    # (this is probably fixed in the current version of pytest-asyncio,
-    # TODO check if still applicable for Python 3.7)
-    asyncio.set_event_loop_policy(None)
-    adjust_event_loop_policy()
-
-
-@pytest.fixture(autouse=True)
 def auto_ctx(doctest_namespace):
-    ctx = lt.Context(executor=InlineJobExecutor())
+    ctx = lt.Context(executor=InlineJobExecutor(main_process_gpu=main_process_gpu))
     doctest_namespace["ctx"] = ctx
 
 
@@ -815,22 +832,27 @@ def auto_files(doctest_namespace, hdf5, default_raw):
 
 @pytest.fixture
 def inline_executor():
-    return InlineJobExecutor(debug=True, inline_threads=2)
+    return InlineJobExecutor(debug=True, inline_threads=2, main_process_gpu=main_process_gpu)
 
 
 @pytest.fixture
 def delayed_executor():
-    return DelayedJobExecutor()
+    return DelayedJobExecutor(main_process_gpu=main_process_gpu)
 
 
 @pytest.fixture
 def lt_ctx(inline_executor):
-    return lt.Context(executor=inline_executor, plot_class=Dummy2DPlot)
+    # Enable GPU on main process if GPU is available
+    # to catch any issues with that feature
+    return lt.Context(
+        executor=inline_executor,
+        plot_class=Dummy2DPlot,
+    )
 
 
 @pytest.fixture
 def inline_executor_fast():
-    return InlineJobExecutor(debug=False, inline_threads=2)
+    return InlineJobExecutor(debug=False, inline_threads=2, main_process_gpu=main_process_gpu)
 
 
 @pytest.fixture
@@ -840,12 +862,12 @@ def lt_ctx_fast(inline_executor_fast):
 
 @pytest.fixture
 async def async_executor(local_cluster_url):
-
     pool = AsyncAdapter.make_pool()
     sync_executor = await sync_to_async(
         partial(
             DaskJobExecutor.connect,
-            scheduler_uri=local_cluster_url
+            scheduler_uri=local_cluster_url,
+            main_process_gpu=main_process_gpu,
         ),
         pool=pool,
     )
@@ -856,14 +878,14 @@ async def async_executor(local_cluster_url):
 
 @pytest.fixture
 def dask_executor(local_cluster_url):
-    executor = DaskJobExecutor.connect(local_cluster_url)
+    executor = DaskJobExecutor.connect(local_cluster_url, main_process_gpu=main_process_gpu)
     yield executor
     executor.close()
 
 
 @pytest.fixture
 def concurrent_executor():
-    executor = ConcurrentJobExecutor.make_local()
+    executor = ConcurrentJobExecutor.make_local(main_process_gpu=main_process_gpu)
     yield executor
     executor.close()
 
@@ -887,8 +909,11 @@ async def http_client():
 
 
 @pytest.fixture
-def shared_state():
-    return SharedState()
+async def shared_state():
+    event_bus = EventBus()
+    executor_state = ExecutorState(event_bus=event_bus)
+    yield SharedState(executor_state=executor_state)
+    executor_state.shutdown()
 
 
 class ServerThread(threading.Thread):
@@ -904,8 +929,10 @@ class ServerThread(threading.Thread):
     async def stop(self):
         self.server.stop()
         await self.server.close_all_connections()
-        if self.shared_state.executor_state.have_executor():
-            await self.shared_state.executor_state.get_executor().close()
+        exstate = self.shared_state.executor_state
+        if exstate.have_executor():
+            executor = await exstate.get_executor()
+            await executor.close()
         self.loop.stop()
 
     async def wait_for_stop(self):
@@ -913,11 +940,15 @@ class ServerThread(threading.Thread):
         background task to periodically check if the main thread wants
         us to stop
         """
-        while True:
-            if self.stop_event.is_set():
-                await self.stop()
-                break
-            await asyncio.sleep(0.1)
+        try:
+            while True:
+                if self.stop_event.is_set():
+                    await self.stop()
+                    break
+                await asyncio.sleep(0.1)
+        except Exception:
+            await self.stop()
+            raise
 
     def run(self):
         try:
@@ -949,7 +980,7 @@ def common_server_startup(unused_tcp_port_factory, shared_state, token):
     print(f"starting server at port {port}")
     thread = ServerThread(port, shared_state, token, daemon=True)
     thread.start()
-    assert thread.start_event.wait(timeout=5), "server thread failed to start"
+    assert thread.start_event.wait(timeout=15), "server thread failed to start"
     yield port
     print(f"stopping server at port {port}")
     thread.stop_event.set()
@@ -989,8 +1020,31 @@ def find_unused_port():
         return sock.getsockname()[1]
 
 
-@pytest.fixture(scope='session')
-def local_cluster_url():
+if sys.platform.startswith("win"):
+    # Py3.8+ on Windows need some help with the event loop policy:
+    @pytest.fixture(scope="session", autouse=True)
+    def event_loop_policy():
+        # see also: libertem.common.async_utils.adjust_event_loop_policy
+        try:
+            from asyncio import (
+                WindowsProactorEventLoopPolicy,
+                WindowsSelectorEventLoopPolicy,
+            )
+        except ImportError:
+            return asyncio.get_event_loop_policy()
+        else:
+            # FIXME this might fail if the event loop policy has been overridden by something
+            # incompatible that is not a WindowsProactorEventLoopPolicy. Dask.distributed creates
+            # a custom event loop policy, for example. Fortunately that one should be compatible.
+            # Better would be "duck typing", i.e. to check if the required add_reader() method
+            # of the loop throws a NotImplementedError.
+            if type(asyncio.get_event_loop_policy()) is WindowsProactorEventLoopPolicy:
+                # WindowsProactorEventLoopPolicy is not compatible with tornado 6
+                # fallback to the pre-3.8 default of Selector
+                return WindowsSelectorEventLoopPolicy()
+
+
+def _local_cluster_url():
     """
     Shared dask cluster, can be used repeatedly by different executors.
 
@@ -1014,18 +1068,22 @@ def local_cluster_url():
         },
     }
 
-    with set_num_threads_env(1, set_numba=False):
-        cluster = dd.SpecCluster(
-            workers=spec,
-            **(cluster_kwargs or {})
-        )
-        client = dd.Client(cluster, set_as_default=False)
-        client.wait_for_workers(len(spec))
-        client.close()
+    # use the context manager of SpecCluster here to properly
+    # shut down the LoopRunner in case of older distributed versions:
+    with dd.SpecCluster(
+        workers=spec,
+        **(cluster_kwargs or {})
+    ) as cluster:
+        with set_num_threads_env(1, set_numba=False):
+            client = dd.Client(cluster, set_as_default=False)
+            client.wait_for_workers(len(spec))
+            client.close()
 
-    yield 'tcp://localhost:%d' % cluster_port
+        yield 'tcp://localhost:%d' % cluster_port
 
-    cluster.close()
+
+local_cluster_url = pytest.fixture(scope='session')(_local_cluster_url)
+local_cluster_url_per_module = pytest.fixture(scope='module')(_local_cluster_url)
 
 
 @pytest.fixture(scope='function')
@@ -1036,6 +1094,13 @@ def local_cluster_ctx(dask_executor):
 @pytest.fixture
 def concurrent_ctx(concurrent_executor):
     return lt.Context(executor=concurrent_executor)
+
+
+@pytest.fixture(scope='session')
+def pipelined_ctx():
+    # limit the number of CPU workers started by default
+    with lt.Context.make_with('pipelined', cpus=2) as ctx:
+        yield ctx
 
 
 @pytest.fixture
@@ -1051,38 +1116,69 @@ def points():
     ])
 
 
-@pytest.fixture
-def indices():
-    return np.array([
-        (0, 0),
-        (1, 0),
-        (0, 1),
-        (1, 1),
-        (-1, 0),
-        (0, -1),
-        (-1, -1)
-    ])
+@pytest.fixture(scope="function")
+def standard_bad_ds_params():
+    return [
+        dict(nav_shape=(-1, 2)),
+        dict(nav_shape=4),
+        dict(sig_shape=(3, 17)),
+        dict(sig_shape=(103, -83)),
+        dict(sync_offset=180000000),
+        dict(io_backend="doesn't exist"),
+    ]
 
 
-@pytest.fixture
-def zero():
-    return np.array([0, 0])
+@pytest.fixture()
+def ds_params_tester(lt_ctx, bad_params_logger):
+    def _test_bad_params(ds_key, *args, **params):
+        ds_class = get_dataset_cls(ds_key)
+        kwarg_repr = (
+            textwrap.shorten(f'{k}={repr(v)}', 30, placeholder="...")
+            for k, v in params.items()
+        )
+        stub = (
+            f"{ds_class.__name__}(..., {', '.join(kwarg_repr)})"
+        )
+        try:
+            lt_ctx.load(ds_key, *args, **params)
+        except Exception as e:
+            bad_params_logger.append(f'{stub}\n  RAISED {type(e).__name__}("{e}")')
+            return False
+        bad_params_logger.append(f'{stub}\n  DID NOT raise')
+        return True
+    return _test_bad_params
 
 
-@pytest.fixture
-def a():
-    return np.array([0, 1])
-
-
-@pytest.fixture
-def b():
-    return np.array([1, 0])
+@pytest.fixture(scope="session")
+def bad_params_logger():
+    lines = []
+    yield lines
+    print("\n".join(lines))
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_benchmark_generate_json(config, benchmarks, include_data, machine_info, commit_info):
-    machine_info["freeze"] = [(d.key, d.version) for d in pkg_resources.working_set]
+    machine_info["freeze"] = [
+        (d.metadata['Name'], d.version)
+        for d in distributions()
+    ]
     yield
+
+
+@pytest.fixture(scope="function")
+def set_affinity():
+    current_aff = os.sched_getaffinity(0)
+    current_aff_list = list(sorted(current_aff))
+    # pick a CPU core from the middle (CPU 0 may be special cased by the OS and
+    # thus more noisy).
+    # 4 because HT may result in, for example, CPU 0 == CPU 128, on a system
+    # with 256 threads:
+    mid_cpu = current_aff_list[len(current_aff_list)//4]
+    os.sched_setaffinity(0, [mid_cpu])
+    try:
+        yield
+    finally:
+        os.sched_setaffinity(0, current_aff)
 
 
 def pytest_collectstart(collector):

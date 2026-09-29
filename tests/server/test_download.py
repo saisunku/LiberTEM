@@ -17,7 +17,7 @@ from libertem.io.writers.results import formats  # NOQA: F401
 from libertem.io.writers.results.base import ResultFormatRegistry
 
 
-pytestmark = [pytest.mark.slow]
+pytestmark = [pytest.mark.web_api]
 
 
 @pytest.mark.asyncio
@@ -31,7 +31,6 @@ async def test_download_hdf5(
     # connect to ws endpoint:
     ws_url = f"ws://127.0.0.1:{server_port}/api/events/?token={default_token}"
     async with websockets.connect(ws_url) as ws:
-        await ws.ensure_open()
         print(ws.state)
         print("checkpoint 2")
         initial_msg = json.loads(await ws.recv())

@@ -26,6 +26,12 @@ EMPAD_RAW = os.path.join(EMPAD_TESTDATA_PATH, 'scan_11_x4_y4.raw')
 EMPAD_XML = os.path.join(EMPAD_TESTDATA_PATH, 'acquisition_12_pretty.xml')
 EMPAD_XML_2 = os.path.join(EMPAD_TESTDATA_PATH, 'acquisition_12_pretty.xml')
 EMPAD_XML_SERIES = os.path.join(EMPAD_TESTDATA_PATH, 'acquisition_series_pretty.xml')
+EMPAD_XML_BROKEN_PARAMS = os.path.join(
+    EMPAD_TESTDATA_PATH, 'Magical_DataSet/acquisition_1/acquisition_1.xml',
+)
+EMPAD_XML_BROKEN_PARAMS_BAD = os.path.join(
+    EMPAD_TESTDATA_PATH, 'Magical_DataSet/acquisition_1/acquisition_1_bad.xml',
+)
 HAVE_EMPAD_TESTDATA = os.path.exists(EMPAD_RAW) and os.path.exists(EMPAD_XML)
 
 pytestmark = pytest.mark.skipif(not HAVE_EMPAD_TESTDATA, reason="need EMPAD testdata")  # NOQA
@@ -72,12 +78,21 @@ def default_empad_raw():
     return raw_data[:, :, :128, :]
 
 
-def test_new_empad_xml():
-    executor = InlineJobExecutor()
-    ds = EMPADDataSet(
-        path=EMPAD_XML_2,
-    )
-    ds = ds.initialize(executor)
+def test_new_empad_xml(lt_ctx):
+    ds = lt_ctx.load("empad", path=EMPAD_XML_2)
+    assert ds.shape.to_tuple() == (4, 4, 128, 128)
+
+
+def test_empad_broken_scan_parameters(lt_ctx):
+    ds = lt_ctx.load("empad", path=EMPAD_XML_BROKEN_PARAMS)
+    assert ds.shape.to_tuple() == (128, 16, 128, 128)
+
+
+def test_empad_broken_scan_parameters_bad(lt_ctx):
+    with pytest.raises(ValueError) as excinfo:
+        lt_ctx.load("empad", path=EMPAD_XML_BROKEN_PARAMS_BAD)
+    assert "(128, 17)" in str(excinfo.value)
+    assert "(256, 256)" in str(excinfo.value)
 
 
 def test_series_acquisition_xml():
@@ -145,6 +160,9 @@ def test_read_random(random_empad):
     # ~1MB
     assert tuple(t.tile_slice.shape) == (16, 128, 128)
 
+    for _ in tiles:
+        pass
+
 
 def test_read(default_empad):
     partitions = default_empad.get_partitions()
@@ -160,6 +178,9 @@ def test_read(default_empad):
 
     # ~1MB
     assert tuple(t.tile_slice.shape) == (16, 128, 128)
+
+    for _ in tiles:
+        pass
 
 
 def test_scheme_too_large(default_empad):
@@ -181,6 +202,9 @@ def test_scheme_too_large(default_empad):
     tiles = p.get_tiles(tiling_scheme=tiling_scheme)
     t = next(tiles)
     assert tuple(t.tile_slice.shape) == tuple((depth,) + default_empad.shape.sig)
+
+    for _ in tiles:
+        pass
 
 
 def test_pickle_is_small(default_empad):
@@ -475,3 +499,18 @@ def test_compare_backends_sparse(lt_ctx, default_empad, buffered_empad, as_spars
     buffered_f0 = lt_ctx.run_udf(dataset=buffered_empad, udf=PickUDF(), roi=roi)['intensity']
 
     assert np.allclose(mm_f0, buffered_f0)
+
+
+def test_bad_params(ds_params_tester, standard_bad_ds_params):
+    args = ("empad", EMPAD_XML)
+    for params in standard_bad_ds_params:
+        ds_params_tester(*args, **params)
+
+
+def test_num_partitions(lt_ctx):
+    ds = lt_ctx.load(
+        "empad",
+        path=EMPAD_XML,
+        num_partitions=5,
+    )
+    assert len(list(ds.get_partitions())) == 5

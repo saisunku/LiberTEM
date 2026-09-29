@@ -1,6 +1,5 @@
 import os
 import logging
-from typing import Optional
 import warnings
 import contextlib
 
@@ -115,10 +114,27 @@ class SERDataSet(DataSet):
     sync_offset: int, optional
         If positive, number of frames to skip from start
         If negative, number of blank frames to insert at start
+
+    num_partitions: int, optional
+        Override the number of partitions. This is useful if the
+        default number of partitions, chosen based on common workloads,
+        creates partitions which are too large (or small) for the UDFs
+        being run on this dataset.
     """
-    def __init__(self, path, emipath=None, nav_shape=None,
-                 sig_shape=None, sync_offset=0, io_backend=None):
-        super().__init__(io_backend=io_backend)
+    def __init__(
+        self,
+        path,
+        emipath=None,
+        nav_shape=None,
+        sig_shape=None,
+        sync_offset=0,
+        io_backend=None,
+        num_partitions=None,
+    ):
+        super().__init__(
+            io_backend=io_backend,
+            num_partitions=num_partitions,
+        )
         if io_backend is not None:
             raise ValueError("SERDataSet currently doesn't support alternative I/O backends")
         self._path = path
@@ -280,7 +296,7 @@ class SERPartition(BasePartition):
         self._corrections.apply(tile_data, tile_slice)
 
     def get_tiles(self, tiling_scheme: TilingScheme, dest_dtype="float32", roi=None,
-            array_backend: Optional[ArrayBackend] = None):
+            array_backend: ArrayBackend | None = None):
         if array_backend is None:
             array_backend = self.meta.array_backends[0]
         assert array_backend in (NUMPY, CUDA)

@@ -313,9 +313,8 @@ def test_missing_frames(lt_ctx, io_backend, dm_stack_glob):
         files=list(sorted(dm_stack_glob)),
         nav_shape=nav_shape,
         io_backend=io_backend,
+        num_partitions=4,
     )
-
-    ds.set_num_cores(4)
 
     tileshape = Shape(
         (1,) + tuple(ds.shape.sig),
@@ -357,6 +356,8 @@ def test_scheme_too_large(default_dm):
     tiles = p.get_tiles(tiling_scheme=tiling_scheme)
     t = next(tiles)
     assert tuple(t.tile_slice.shape) == tuple((depth,) + default_dm.shape.sig)
+    for _ in tiles:
+        pass
 
 
 def test_offset_smaller_than_image_count(lt_ctx, dm_stack_glob):
@@ -492,3 +493,31 @@ def test_nonstack_files(lt_ctx):
             "dm",
             files=files,
         )
+
+
+def test_stack_in_an_inline_pickle(default_dm, lt_ctx):
+    # make sure the __new__ magic works with pickle
+    import cloudpickle
+    ds = cloudpickle.loads(cloudpickle.dumps(default_dm))
+    lt_ctx.run_udf(dataset=ds, udf=SumUDF())
+
+
+def test_load_stack_dd(local_cluster_ctx, dm_stack_glob):
+    files = dm_stack_glob
+    ds = local_cluster_ctx.load("dm", files=files, same_offset=True)
+    ds.check_valid()
+
+
+def test_bad_params(ds_params_tester, standard_bad_ds_params, dm_3d_glob):
+    for params in standard_bad_ds_params:
+        ds_params_tester("dm", files=dm_3d_glob, **params)
+
+
+def test_files_argument_error_message_includes_type():
+    with pytest.raises(DataSetException) as excinfo:
+        DMDataSet(files="not-a-list")
+
+    msg = str(excinfo.value)
+    assert "<class 'str'>" in msg
+    assert "{type(files)}" not in msg
+    assert "received" in msg

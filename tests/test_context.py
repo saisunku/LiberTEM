@@ -1,17 +1,26 @@
-import sys
+import time
 import copy
 from unittest import mock
+import contextlib
+
 
 import pytest
 import numpy as np
 import sparse
 import scipy.sparse
 
+from libertem.common.buffers import BufferWrapper
+from libertem.common.executor import (
+    TaskProtocol, WorkerQueue, TaskCommHandler,
+)
 from libertem.io.dataset.base import MMapBackend
+from libertem.udf import UDF, UDFRunCancelled
 from libertem.udf.sum import SumUDF
 from libertem.udf.sumsigudf import SumSigUDF
-from libertem.udf.base import NoOpUDF
+from libertem.udf.base import NoOpUDF, MergeAttrMapping
 from libertem.api import Context
+from libertem.common.exceptions import ExecutorSpecException
+from libertem.utils.devices import detect
 
 
 def test_ctx_load(lt_ctx, default_raw):
@@ -51,6 +60,8 @@ def test_run_udf_with_io_backend(lt_ctx, default_raw):
     assert np.array(res['intensity']).shape == (128, 128)
 
 
+# ignore 'no plottable channels' from NoOpUDF:
+@pytest.mark.filterwarnings('ignore:no plottable channels:UserWarning')
 @pytest.mark.parametrize('progress', (True, False))
 @pytest.mark.parametrize('plots', (None, True))
 def test_multi_udf(lt_ctx, default_raw, progress, plots):
@@ -68,6 +79,7 @@ def test_multi_udf(lt_ctx, default_raw, progress, plots):
             assert np.all(res[key].data == combined_res[index][key].data)
 
 
+@pytest.mark.filterwarnings('ignore::UserWarning')  # ignore 'no plottable channels' from NoOpUDF
 @pytest.mark.parametrize('progress', (True, False))
 @pytest.mark.parametrize('plots', (None, True))
 @pytest.mark.asyncio
@@ -93,6 +105,7 @@ async def test_multi_udf_async(lt_ctx, default_raw, progress, plots):
             assert np.all(single_res[index][key].data == combined_res[index][key].data)
 
 
+@pytest.mark.filterwarnings('ignore::UserWarning')  # ignore 'no plottable channels' from NoOpUDF
 @pytest.mark.parametrize('progress', (True, False))
 @pytest.mark.parametrize('plots', (None, True))
 def test_udf_iter(lt_ctx, default_raw, progress, plots):
@@ -112,6 +125,7 @@ def test_udf_iter(lt_ctx, default_raw, progress, plots):
             assert np.all(ref_item == res_item)
 
 
+@pytest.mark.filterwarnings('ignore::UserWarning')  # ignore 'no plottable channels' from NoOpUDF
 @pytest.mark.parametrize('progress', (True, False))
 @pytest.mark.parametrize('plots', (None, True))
 @pytest.mark.asyncio
@@ -134,6 +148,7 @@ async def test_udf_iter_async(lt_ctx, default_raw, progress, plots):
             assert np.all(ref_item == res_item)
 
 
+@pytest.mark.filterwarnings('ignore::UserWarning')  # ignore 'no plottable channels' from NoOpUDF
 @pytest.mark.parametrize(
     'plots', (
         True,
@@ -236,14 +251,11 @@ roi_types = (
     sparse.DOK,
     scipy.sparse.coo_matrix,
     scipy.sparse.csr_matrix,
+    scipy.sparse.csr_array,
     list,
     tuple,
     int,
 )
-
-if sys.version_info >= (3, 8) and hasattr(scipy.sparse, 'csr_array'):
-    # csr_array was added ~scipy 1.8, which needs Python 3.8
-    roi_types = roi_types + (scipy.sparse.csr_array,)
 
 
 @pytest.mark.parametrize(
@@ -256,6 +268,8 @@ def test_allowed_rois(lt_ctx, default_raw, roi_type):
     if issubclass(roi_type, sparse.SparseArray):
         roi_input = roi_type.from_numpy(roi)
     elif issubclass(roi_type, scipy.sparse.spmatrix):
+        roi_input = roi_type(roi)
+    elif hasattr(scipy.sparse, 'sparray') and issubclass(roi_type, scipy.sparse.sparray):
         roi_input = roi_type(roi)
     elif roi_type in (tuple, list):
         roi_input = np.argwhere(roi)
@@ -276,11 +290,374 @@ def test_make_with_inline(inline_executor):
     assert isinstance(ctx.executor, inline_executor.__class__)
 
 
-def test_make_with_threads(concurrent_executor):
-    ctx = Context.make_with('threads')
+def test_make_with_inline_raises():
+    with pytest.raises(ExecutorSpecException):
+        Context.make_with('inline', cpus=4)
+
+
+@pytest.mark.parametrize('n_threads', (None, 4, (2, 3)))
+def test_make_with_threads(concurrent_executor, n_threads):
+    ctx = Context.make_with('threads', cpus=n_threads)
     assert isinstance(ctx.executor, concurrent_executor.__class__)
+    # No way to check number of workers in a concurrent.futures.Executor!
+
+
+@pytest.mark.parametrize('exec_spec', ('threads', 'inline', 'delayed'))
+def test_make_with_raises_gpus_no_support(exec_spec):
+    with pytest.raises(ExecutorSpecException):
+        Context.make_with(exec_spec, gpus=4)
 
 
 def test_make_with_unrecognized():
-    with pytest.raises(ValueError):
+    with pytest.raises(ExecutorSpecException):
         Context.make_with('not_an_executor')
+
+
+def test_udf_cancellation(default_raw):
+    from libertem.common.executor import JobCancelledError
+    ctx = Context.make_with('inline')
+
+    # As we don't have an API for explicit cancellation by the user yet, we
+    # raise `JobCancelledError` from `process_frame` of the UDF.  In reality, it
+    # would be raised either from somewhere inside the UDF runner on explicit
+    # cancellation, or from the executor when the data source has run dry.
+
+    class DumbUDF(UDF):
+        def get_result_buffers(self):
+            return {
+                'stuff': self.buffer(kind='nav', dtype='float32'),
+            }
+
+        def process_frame(self, frame):
+            raise JobCancelledError()
+
+    res_iter = ctx.run_udf_iter(dataset=default_raw, udf=DumbUDF())
+
+    # TODO: support `res_iter.cancel_run()` or similar
+    with pytest.raises(UDFRunCancelled) as ex:
+        for part in res_iter:
+            pass
+
+    assert ex.match(r"^UDF run cancelled after \d+ partitions$")
+
+
+class DynamicParamsUDF(UDF):
+    def __init__(self, latest_index, delay=0.0):
+        super().__init__(latest_index=latest_index, delay=delay)
+
+    def get_result_buffers(self) -> dict[str, BufferWrapper]:
+        return {
+            'index': self.buffer(kind='nav', dtype=int),
+            'index_merge': self.buffer(kind='nav', dtype=int),
+        }
+
+    def process_partition(self, partition):
+        print(f"DynamicParamsUDF {self.params.latest_index}")
+        # no need to sleep if we have successfully updated the parameter:
+        if self.params.latest_index == 0:
+            time.sleep(self.params.delay)
+        self.results.index[:] = self.params.latest_index
+
+    def merge(self, dest: MergeAttrMapping, src: MergeAttrMapping):
+        dest.index[:] = src.index
+        dest.index_merge = self.params.latest_index
+
+
+def test_dynamic_parameter_update_sync(lt_ctx, default_raw):
+    result_iter = lt_ctx.run_udf_iter(
+        dataset=default_raw, udf=[DynamicParamsUDF(latest_index=0)]
+    )
+    with contextlib.closing(result_iter) as result_iter:
+        # because this is using the inline executor, we can guarantee
+        # that the updated parameters are used for the next partition.
+        for idx, part_res in enumerate(result_iter):
+            result_iter.update_parameters_experimental([
+                {"latest_index": idx + 1}
+            ])
+            print(idx, part_res.buffers[0]['index'].data)
+        # `default_raw` has at least two partitions, so there should be
+        # something non-zero in the result:
+        assert not np.allclose(part_res.buffers[0]['index'], 0)
+        assert not np.allclose(part_res.buffers[0]['index_merge'], 0)
+
+
+@pytest.mark.parametrize('executor', ['pipelined', 'dask', 'inline', 'concurrent'])
+def test_dynamic_parameter_update_integration(
+    executor, local_cluster_ctx, pipelined_ctx, concurrent_executor,
+):
+
+    # we do this dance to re-use the existing executors, so we don't have to
+    # mark this test as slow:
+    ctx: Context
+    if executor == 'dask':
+        ctx = local_cluster_ctx
+    elif executor == 'pipelined':
+        ctx = pipelined_ctx
+    elif executor == 'inline':
+        ctx = Context.make_with('inline')
+    elif executor == 'concurrent':
+        ctx = Context(executor=concurrent_executor)
+    else:
+        raise ValueError('invalid executor name')
+
+    num_workers = sum(
+        w.nthreads for w in ctx.executor.get_available_workers()
+    )
+    parts = 15
+    delay = 0.025
+
+    # this should make it more likely that we wait long enough in the main
+    # process for the first task to finish, meaning we get to update the index
+    # as soon as possible
+    delay_udf = delay / 2
+    dataset = ctx.load(
+        "memory",
+        num_partitions=num_workers * parts,
+        datashape=(num_workers * parts, 16, 16),
+        sig_dims=2,
+    )
+
+    class DelayingCommHandler(TaskCommHandler):
+        def handle_task(self, task: TaskProtocol, queue: WorkerQueue):
+            # our tests only work if the tasks don't all get submitted at the
+            # beginning of the `run_tasks` call - this simulates the live
+            # processing scenario
+            time.sleep(delay)
+    dataset.get_task_comm_handler = lambda: DelayingCommHandler()
+
+    result_iter = ctx.run_udf_iter(
+        dataset=dataset, udf=[DynamicParamsUDF(latest_index=0, delay=delay_udf)]
+    )
+    with contextlib.closing(result_iter) as result_iter:
+        for idx, part_res in enumerate(result_iter):
+            result_iter.update_parameters_experimental([
+                {"latest_index": idx + 1}
+            ])
+            print(idx, part_res.buffers[0]['index'].data)
+        assert not np.allclose(part_res.buffers[0]['index'], 0)
+        assert not np.allclose(part_res.buffers[0]['index_merge'], 0)
+
+    # second run, to make sure we don't mess up any state:
+    result_iter = ctx.run_udf_iter(
+        dataset=dataset, udf=[DynamicParamsUDF(latest_index=0, delay=delay_udf)]
+    )
+    with contextlib.closing(result_iter) as result_iter:
+        for idx, part_res in enumerate(result_iter):
+            result_iter.update_parameters_experimental([
+                {"latest_index": idx + 1}
+            ])
+            print(idx, part_res.buffers[0]['index'].data)
+        assert not np.allclose(part_res.buffers[0]['index'], 0)
+        assert not np.allclose(part_res.buffers[0]['index_merge'], 0)
+
+
+@pytest.mark.asyncio
+async def test_dynamic_parameter_update_async(lt_ctx, default_raw):
+    result_iter = lt_ctx.run_udf_iter(
+        dataset=default_raw,
+        udf=[DynamicParamsUDF(latest_index=0)],
+        sync=False,
+    )
+    try:
+        # because this is using the inline executor, we can guarantee
+        # that the updated parameters are used for the next partition.
+        idx = 0  # no aenumerate in stdlib :(
+        async for part_res in result_iter:
+            await result_iter.update_parameters_experimental([
+                {"latest_index": idx + 1}
+            ])
+            print(idx, part_res.buffers[0]['index'].data)
+            idx += 1
+        # `default_raw` has at least two partitions, so there should be
+        # something non-zero in the result:
+        assert not np.allclose(part_res.buffers[0]['index'], 0)
+        assert not np.allclose(part_res.buffers[0]['index_merge'], 0)
+    finally:
+        await result_iter.aclose()
+
+
+class DynamicParamsAuxUDF(UDF):
+    def __init__(self, latest_index):
+        super().__init__(latest_index=latest_index)
+
+    def get_result_buffers(self) -> dict[str, BufferWrapper]:
+        return {
+            'index': self.buffer(kind='nav', dtype=int),
+            'index_merge': self.buffer(kind='nav', dtype=int),
+        }
+
+    def process_partition(self, partition):
+        print(f"DynamicParamsAuxUDF.process_partition {self.params.latest_index}")
+        self.results.index[:] = self.params.latest_index[:, 2]
+        # the correct view is set:
+        assert np.allclose(
+            self.meta.coordinates,
+            self.params.latest_index[:, :2],
+        )
+
+    def merge(self, dest: MergeAttrMapping, src: MergeAttrMapping):
+        print(self.params.latest_index.shape)
+        print(f"DynamicParamsAuxUDF.merge: {self.params.latest_index}")
+        dest.index[:] = src.index
+        dest.index_merge = self.params.latest_index[:, 2]
+
+
+def test_dynamic_parameter_aux_data(lt_ctx, default_raw):
+    def _aux_data(idx):
+        coords = np.moveaxis(
+            np.indices(default_raw.shape.nav),
+            0,
+            -1,
+        ).astype(np.float32).reshape((-1, 2))
+        idx_arr = np.zeros((coords.shape[0], 1), dtype=np.float32)
+        idx_arr[:] = idx
+        aux = DynamicParamsAuxUDF.aux_data(
+            data=np.hstack([coords, idx_arr]),
+            kind="nav", dtype=np.float32, extra_shape=(3,)
+        )
+        return aux
+    aux = _aux_data(0)
+    result_iter = lt_ctx.run_udf_iter(
+        dataset=default_raw, udf=[DynamicParamsAuxUDF(latest_index=aux)]
+    )
+    with contextlib.closing(result_iter) as result_iter:
+        # because this is using the inline executor, we can guarantee
+        # that the updated parameters are used for the next partition.
+        for idx, part_res in enumerate(result_iter):
+            aux = _aux_data(idx + 1)
+            result_iter.update_parameters_experimental([
+                {"latest_index": aux}
+            ])
+        # `default_raw` has at least two partitions, so there should be
+        # something non-zero in the result:
+        assert not np.allclose(part_res.buffers[0]['index'], 0)
+        assert not np.allclose(part_res.buffers[0]['index_merge'], 0)
+
+
+@pytest.mark.asyncio
+async def test_res_iter_athrow(lt_ctx: Context, default_raw):
+    result_iter = lt_ctx.run_udf_iter(
+        dataset=default_raw,
+        udf=SumUDF(),
+        sync=False,
+    )
+
+    with pytest.raises(RuntimeError):
+        async for res in result_iter:
+            await result_iter.athrow(RuntimeError("stuff"))
+
+
+def test_res_iter_throw(lt_ctx: Context, default_raw):
+    result_iter = lt_ctx.run_udf_iter(
+        dataset=default_raw,
+        udf=SumUDF(),
+    )
+
+    with pytest.raises(RuntimeError):
+        for res in result_iter:
+            result_iter.throw(RuntimeError("stuff"))
+
+
+class CheckXPUDF(UDF):
+    def get_result_buffers(self):
+        return {
+            'process_cupy': self.buffer(kind='nav', dtype='bool'),
+            'merge_cupy': self.buffer(kind='nav', dtype='bool'),
+            'result_cupy': self.buffer(
+                kind='single', dtype='bool', extra_shape=(1, ), use='result_only'
+            ),
+        }
+
+    def xp_is_cupy(self):
+        is_numpy = self.xp.__name__ == 'numpy'
+        is_cupy = self.xp.__name__ == 'cupy'
+        if is_numpy == is_cupy:
+            raise RuntimeError(f'numpy/cupy detection failed on self.xp {str(self.xp)}')
+        return is_cupy
+
+    def process_frame(self, frame):
+        self.results.process_cupy[:] = self.xp_is_cupy()
+
+    def merge(self, dest, src):
+        dest.process_cupy[:] = src.process_cupy[:]
+        dest.merge_cupy[:] = self.xp_is_cupy()
+
+    def get_results(self):
+        res = np.zeros((1, ), dtype='bool')
+        res[0] = self.xp_is_cupy()
+        return {
+            'result_cupy': res,
+        }
+
+
+@pytest.mark.parametrize(
+    'main_process_gpu', (True, False, 0, None)
+)
+@pytest.mark.parametrize(
+        'executor', ('inline', 'threads', 'delayed', 'dask-integration')
+)
+def test_with_main_gpu(executor, main_process_gpu):
+    with_main_gpu(executor, main_process_gpu)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    'main_process_gpu', (True, False, 0, None)
+)
+@pytest.mark.parametrize(
+        'executor', ('pipelined', 'dask')
+)
+def test_with_main_gpu_slow(executor, main_process_gpu):
+    with_main_gpu(executor, main_process_gpu)
+
+
+def with_main_gpu(executor, main_process_gpu):
+    d = detect()
+    has_cupy = d['has_cupy']
+    if not has_cupy and (main_process_gpu is True or type(main_process_gpu) is int):
+        with pytest.raises(ExecutorSpecException):
+            ctx = Context.make_with(executor, main_process_gpu=main_process_gpu)
+    else:
+        if executor in ['dask', 'pipelined']:
+            cpus = [0, 1]
+        else:
+            cpus = None
+        ctx = Context.make_with(executor, cpus=cpus, main_process_gpu=main_process_gpu)
+        try:
+            udf = CheckXPUDF()
+            ds = ctx.load('memory', data=np.zeros((1, 1, 1, 1)))
+            res = ctx.run_udf(dataset=ds, udf=udf)
+            use_cupy = has_cupy and (
+                main_process_gpu is True
+                or main_process_gpu is None
+                or type(main_process_gpu) is int
+            )
+            if use_cupy:
+                assert np.all(res['merge_cupy'])
+                assert np.all(res['result_cupy'])
+            else:
+                assert not np.any(res['merge_cupy'])
+                assert not np.any(res['result_cupy'])
+            assert not np.any(res['process_cupy'])
+        finally:
+            ctx.close()
+
+
+@pytest.mark.slow
+def test_default_context_with_main_gpu():
+    d = detect()
+    use_cupy = d['has_cupy'] and d['cudas']
+    ctx = Context()
+    try:
+        udf = CheckXPUDF()
+        ds = ctx.load('memory', data=np.zeros((1, 1, 1, 1)))
+        res = ctx.run_udf(dataset=ds, udf=udf)
+        if use_cupy:
+            assert np.all(res['merge_cupy'])
+            assert np.all(res['result_cupy'])
+        else:
+            assert not np.any(res['merge_cupy'])
+            assert not np.any(res['result_cupy'])
+        assert not np.any(res['process_cupy'])
+    finally:
+        ctx.close()

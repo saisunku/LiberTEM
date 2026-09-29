@@ -3,8 +3,9 @@ import { useSelector } from "react-redux";
 import ClusterConnectionForm from "../../cluster/components/ClusterConnectionForm";
 import { assertNotReached } from "../../helpers";
 import { RootReducer } from "../../store";
+import { ChannelStatusCodes } from "../reducers";
 import ChannelConnecting from "./ChannelConnecting";
-import ChannelShutdown from './ChannelShutdown'
+import ChannelShutdown from './ChannelShutdown';
 
 const messages = {
     waiting: "Waiting...",
@@ -14,7 +15,9 @@ const messages = {
 const clusterMessages = {
     connected: "Connected, waiting for initial state...",
     unknown: "Connected, fetching cluster status...",
-    connecting: "Connecting to cluster"
+    connecting: "Connecting to cluster",
+    snoozed: "Cluster is snoozed",
+    unsnoozing: "Cluster is unsnoozing"
 }
 
 const ConnectedNotReady: React.FC = () => {
@@ -33,24 +36,31 @@ const ConnectedNotReady: React.FC = () => {
     } else if (clusterConnection.status === "connecting") {
         return <ChannelConnecting msg={clusterMessages.connecting} />
     }
+    // else if (clusterConnection.status === "snoozed") {
+        // return <ChannelConnecting msg={clusterMessages.snoozed} />
+    // } else if (clusterConnection.status === "unsnoozing") {
+        // return <ChannelConnecting msg={clusterMessages.unsnoozing} />
+    // }
     assertNotReached("should not happen");
     return null;
 }
 
-const ChannelStatus: React.FC = ({ children }) => {
+const ChannelStatus: React.FC<{ children?: React.ReactNode }> = ({ children }) => {
     const channelStatus = useSelector((state: RootReducer) => state.channelStatus);
 
     switch (channelStatus.status) {
-        case "waiting":
-        case "connecting": {
+        case ChannelStatusCodes.WAITING:
+        case ChannelStatusCodes.CONNECTING: {
             return <ChannelConnecting msg={messages[channelStatus.status]} />;
         }
-        case "connected": {
+        case ChannelStatusCodes.CONNECTED: {
             return <ConnectedNotReady />
         }
-        case "ready":
+        case ChannelStatusCodes.READY:
+        case ChannelStatusCodes.SNOOZED:
+        case ChannelStatusCodes.UNSNOOZING:
             return <>{children}</>;
-        case "disconnected":
+        case ChannelStatusCodes.DISCONNECTED:
             return <ChannelShutdown />
         default:
             assertNotReached("should not happen");

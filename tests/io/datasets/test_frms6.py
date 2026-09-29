@@ -122,6 +122,7 @@ def default_frms6_raw(tmpdir_factory):
     # Might be needed for windows, so we don't keep any views, mmaps or open
     # file handles around:
     del view
+    data._mmap.close()
     del data
     os.unlink(fn)
 
@@ -237,7 +238,7 @@ def test_check_valid(default_frms6):
 
 
 @needsdata
-def test_sum_analysis(default_frms6, lt_ctx):
+def test_sum_analysis(default_frms6, local_cluster_ctx):
     roi = {
         "shape": "disk",
         "cx": 5,
@@ -248,7 +249,7 @@ def test_sum_analysis(default_frms6, lt_ctx):
         "roi": roi,
     })
     # not checking result yet, just making sure it doesn't crash:
-    lt_ctx.run(analysis)
+    local_cluster_ctx.run(analysis)
 
 
 @needsdata
@@ -416,8 +417,12 @@ def test_read_invalid_tileshape(default_frms6):
         dataset_shape=default_frms6.shape,
     )
 
+    tiles = p.get_tiles(tiling_scheme=tiling_scheme)
     with pytest.raises(ValueError):
-        next(p.get_tiles(tiling_scheme=tiling_scheme))
+        next(tiles)
+
+    for _ in tiles:
+        pass
 
 
 @needsdata
@@ -440,6 +445,9 @@ def test_scheme_too_large(default_frms6):
     tiles = p.get_tiles(tiling_scheme=tiling_scheme)
     t = next(tiles)
     assert tuple(t.tile_slice.shape) == tuple((depth,) + default_frms6.shape.sig)
+
+    for _ in tiles:
+        pass
 
 
 @needsdata
@@ -623,3 +631,19 @@ def test_compare_backends_sparse(lt_ctx, default_frms6, buffered_frms6, as_spars
     buffered_f0 = lt_ctx.run_udf(dataset=buffered_frms6, udf=PickUDF(), roi=roi)['intensity']
 
     assert np.allclose(mm_f0, buffered_f0)
+
+
+def test_bad_params(ds_params_tester, standard_bad_ds_params):
+    args = ("frms6", FRMS6_TESTDATA_PATH)
+    for params in standard_bad_ds_params:
+        ds_params_tester(*args, **params)
+
+
+@needsdata
+def test_num_partitions(lt_ctx):
+    ds = lt_ctx.load(
+        "frms6",
+        path=FRMS6_TESTDATA_PATH,
+        num_partitions=129,
+    )
+    assert len(list(ds.get_partitions())) == 129

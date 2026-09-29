@@ -1,13 +1,15 @@
 import time
 import logging
 import asyncio
-from typing import TYPE_CHECKING, Callable, Optional, TypeVar
+from typing import TYPE_CHECKING, TypeVar
+from collections.abc import Callable
 
 from opentelemetry import trace
 
 from libertem.analysis.base import Analysis, AnalysisResultSet
 from libertem.common.executor import JobCancelledError
 from libertem.common.tracing import TracedThreadPoolExecutor
+from libertem.common.progress import ProgressReporter, ProgressState
 from libertem.udf.base import UDFResults
 from libertem.io.dataset.base.dataset import DataSet
 from libertem.web.models import AnalysisDetails
@@ -23,6 +25,49 @@ if TYPE_CHECKING:
     from .events import EventRegistry
 
 T = TypeVar('T')
+
+
+class WebProgressReporter(ProgressReporter):
+    """
+    Progress reporter that pumps `ProgressState`
+    messages out via the event registry mechanism.
+
+    The `start`/`update`/`end` callbacks are invoked from
+    the context of the `UDFRunner` implementation, so
+    we need to make sure we schedule the websocket
+    response tasks on the correct event loop
+    (the one used by the web API)
+    """
+
+    def __init__(
+        self,
+        state: SharedState,
+        event_registry: "EventRegistry",
+        loop: asyncio.AbstractEventLoop,
+        job_id: str,
+    ):
+        self.event_registry = event_registry
+        self.state = state
+        self.loop = loop
+        self.job_id = job_id
+
+    def start(self, state: ProgressState):
+        self.handle_state_update(state, "start")
+
+    def update(self, state: ProgressState):
+        self.handle_state_update(state, "update")
+
+    def end(self, state: ProgressState):
+        self.handle_state_update(state, "end")
+
+    def handle_state_update(self, state: ProgressState, event: str):
+        msg = Message().job_progress(
+            job_id=self.job_id, state=state, event=event
+        )
+
+        async def _task():
+            await self.event_registry.broadcast_event(msg)
+        asyncio.run_coroutine_threadsafe(_task(), loop=self.loop)
 
 
 class JobEngine:
@@ -71,13 +116,13 @@ class JobEngine:
                     details=analysis_details,
                 )
             except JobCancelledError:
-                msg = Message(self.state).cancel_done(job_id)
+                msg = Message().cancel_done(job_id)
                 log_message(msg)
                 await self.event_registry.broadcast_event(msg)
                 return
             except Exception as e:
                 log.exception("error running job, params=%r", params)
-                msg = Message(self.state).job_error(job_id, "error running job: %s" % str(e))
+                msg = Message().job_error(job_id, "error running job: %s" % str(e))
                 self.event_registry.broadcast_event(msg)
                 await self.state.job_state.remove(job_id)
 
@@ -120,9 +165,10 @@ class JobEngine:
         udf = analysis.get_udf()
         roi = analysis.get_roi()
 
-        executor = self.state.executor_state.get_executor()
-        msg = Message(self.state).start_job(
-            job_id=job_id, analysis_id=analysis_id,
+        executor = await self.state.executor_state.get_executor()
+        serialized_job = self.state.job_state.serialize(job_id)
+        msg = Message().start_job(
+            serialized_job=serialized_job, analysis_id=analysis_id,
         )
         self.event_registry.broadcast_event(msg)
 
@@ -165,8 +211,21 @@ class JobEngine:
         # FIXME: allow to set correction data for a dataset via upload and local loading
         corrections = dataset.get_correction_data()
         runner_cls = executor.get_udf_runner()
-        result_iter = runner_cls([udf]).run_for_dataset_async(
-            dataset, executor, roi=roi, cancel_id=job_id, corrections=corrections,
+        progress_reporter = WebProgressReporter(
+            state=self.state,
+            event_registry=self.event_registry,
+            loop=asyncio.get_event_loop(),
+            job_id=job_id,
+        )
+        result_iter = runner_cls(
+            udfs=[udf],
+            progress_reporter=progress_reporter
+        ).run_for_dataset_async(
+            dataset, executor,
+            roi=roi,
+            cancel_id=job_id,
+            corrections=corrections,
+            progress=True,
         )
         async for udf_results in result_iter:
             window = min(max(window, 2*(t - post_t)), 5)
@@ -206,7 +265,7 @@ class JobEngine:
         analysis_id: str,
         details: AnalysisDetails,
         finished=False,
-        udf_results: Optional[UDFResults] = None
+        udf_results: UDFResults | None = None
     ) -> None:
         if self.state.job_state.is_cancelled(job_id):
             raise JobCancelledError()
@@ -214,8 +273,9 @@ class JobEngine:
         if self.state.job_state.is_cancelled(job_id):
             raise JobCancelledError()
         if finished:
-            msg = Message(self.state).finish_job(
-                job_id=job_id,
+            serialized_job = self.state.job_state.serialize(job_id)
+            msg = Message().finish_job(
+                serialized_job=serialized_job,
                 num_images=len(results),
                 image_descriptions=[
                     {"title": result.title, "desc": result.desc,
@@ -227,7 +287,7 @@ class JobEngine:
                 analysis_id, details, results, job_id, udf_results
             )
         else:
-            msg = Message(self.state).task_result(
+            msg = Message().task_result(
                 job_id=job_id,
                 num_images=len(results),
                 image_descriptions=[
@@ -254,9 +314,10 @@ class JobEngine:
     async def send_existing_job_results(self):
         results = self.state.analysis_state.get_all_results()
         for analysis_id, (details, result_set, job_id, udf_results) in results:
+            serialized_job = self.state.job_state.serialize(job_id)
             await self.event_registry.broadcast_event(
-                Message(self.state).start_job(
-                    job_id=job_id, analysis_id=analysis_id,
+                Message().start_job(
+                    serialized_job=serialized_job, analysis_id=analysis_id,
                 )
             )
             await self.send_results(

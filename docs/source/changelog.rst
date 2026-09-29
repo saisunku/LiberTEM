@@ -5,13 +5,15 @@ Changelog
 
     from libertem import api
     from libertem.executor.inline import InlineJobExecutor
+    from libertem.udf.sum import SumUDF
 
     ctx = api.Context(executor=InlineJobExecutor())
     dataset = ctx.load("memory", datashape=(16, 16, 16, 16), sig_dims=2)
+    udf = SumUDF()
 
 .. _continuous:
 
-0.11.0.dev0
+0.17.0.dev0
 ###########
 
 .. toctree::
@@ -19,7 +21,563 @@ Changelog
 
   changelog/*/*
 
+
 .. _latest:
+
+.. _`v0-16-0`:
+
+0.16.0 / 2026-05-19
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.20283773.svg
+  :target: https://doi.org/10.5281/zenodo.20283773
+
+Notable changes include GPU processing for operations on the main node (chiefly
+:meth:`libertem.udf.base.UDF.merge` and
+:meth:`libertem.udf.base.UDF.get_results`) through
+:attr:`libertem.udf.base.UDF.xp`. This is targeted at methods like iDPC and iCoM
+where the result is calculated in :meth:`libertem.udf.base.UDF.get_results` with
+Fourier transforms over the displacement vector field that run much faster on
+GPUs compared to CPUs. It is enabled by default and can be controlled with the
+new :code:`main_process_gpu` parameter for
+:meth:`libertem.api.Context.make_with` (:pr:`1759`).
+
+Furthermore, the web interface and live plots now include an outlier filter that
+excludes values from the plot range that are at the very edge of the value
+distribution and very different from the remaining values. This is particularly
+useful for data from detectors where dead pixels are set to the maximum value,
+e.g. Dectris (:issue:`1310` :pr:`1742`).
+
+In case of async iteration over results, we now make sure the merge function is
+not running concurrently with accessing and using the result buffers to make
+sure their state is consistent when accessed. Also, the
+:meth:`~libertem.udf.base.UDF.get_results` method is called lazily, reducing
+overheads (:pr:`1632`).
+
+Many thanks to everyone who helped with this release, and welcome to new
+contributor :user:`yaochengchen` (:pr:`1797,1799`)!
+
+Features
+--------
+
+* Support for Python 3.14 (:pr:`1790`).
+* Optional result-only monitoring buffer in :class:`~libertem.udf.auto.AutoUDF`
+  that can be activated with parameter :code:`monitor=True` to allow monitoring
+  the most recent result during live plotting (:pr:`1750`).
+
+Bugfixes
+--------
+
+* Typo and f-string formatting in
+  :class:`~libertem.io.dataset.dm.StackedDMDataSet` error message (:pr:`1797`).
+* Token auth properly returns the HTTP response in case of errors
+  (:pr:`1790`).
+* The exception type raised by the :code:`'raw_csr'` dataset when encountering
+  invalid TOML changed from :class:`tomli.TOMLDecodeError` to
+  :class:`libertem.io.dataset.raw_csr.TOMLError` since
+  :class:`tomli.TOMLDecodeError` is no longer picklable (:pr:`1789`).
+* Match partition count to cores to split work evenly and reduce "stragglers"
+  that drive up the clock time to finish (:pr:`1796`).
+* Origin length mismatch in :meth:`~libertem.common.slice.Slice.adjust_for_roi`
+  caused by negative slicing when ``sig_dims`` is 0 (:pr:`1799`).
+
+Obsolescence
+------------
+
+* The modules :code:`libertem.analysis.gridmatching` and
+  :code:`libertem.analysis.fullmatch` have been removed from LiberTEM 0.16. They
+  are available from :mod:`libertem_blobfinder.common.gridmatching` and
+  :mod:`libertem_blobfinder.common.fullmatch` since :mod:`libertem-blobfinder`
+  version 0.6 (:issue:`1469`, :pr:`1600,1828`).
+* Drop Python 3.9 support (:pr:`1791`).
+
+.. _`v0-15-2`:
+
+0.15.2 / 2025-07-14
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.15877919.svg
+  :target: https://doi.org/10.5281/zenodo.15877919
+
+Fix for a backwards-incompatible change of :code:`scheduler_info()` in
+Dask Distributed 2025.4.0 (:pr:`1751`, see also
+`dask/distributed#9045 <https://github.com/dask/distributed/pull/9045>`_).
+
+Special thanks to Mat who tracked this down!
+
+.. _`v0-15-1`:
+
+0.15.1 / 2025-06-16
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.15676206.svg
+  :target: https://doi.org/10.5281/zenodo.15676206
+
+Fix dependency specifications to allow installation in Gatan Digital Micrograph
+Python environment with Python 3.10 and NumPy 1.23.5 (:pr:`1743`).
+
+
+.. _`v0-15-0`:
+
+0.15.0 / 2025-06-04
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.15584540.svg
+  :target: https://doi.org/10.5281/zenodo.15584540
+
+With the release 0.15.0 LiberTEM is **re-licensed** under the **MIT license**
+(:pr:`1689`)! Subprojects, in particular `LiberTEM-live
+<https://github.com/LiberTEM/LiberTEM-live/pull/172>`__, will follow as far as
+their upstream licenses allow. Many thanks to all creators for agreeing to this
+change! We hope that this makes integrating LiberTEM into other software or
+systems easier. The discussion can be found at :issue:`1649`.
+
+Thanks to a joint bug hunt with Gatan, LiberTEM (and many other Python packages)
+work again within the Python scripting environment of Gatan Digital Micrograph /
+GMS since at least version 3.61 and newer. That allowed us to update the GMS
+integration examples. Most notably, they now default to the threaded executor
+which combines fast startup with decent performance on most systems. Many thanks
+for the fruitful collaboration!
+
+A warm welcome and many thanks to `Sivert Dagenborg
+<https://github.com/sivborg>`_ who started contributing to LiberTEM with this
+release. Thanks go out to all other contributors as well!
+
+Features
+--------
+
+* Add support for 16-bit BLO v1.3 files (:pr:`1676`).
+* Support to snooze the executor after inactivity to free resources occupied by
+  worker processes, in particular GPU memory held by CuPy. This was previously
+  available in the web client, but has now been exposed in the Python API.
+  It is supported only in the default :code:`DaskJobExecutor` at this time
+  (:issue:`1576`, :pr:`1690`). Currently, it must be activated by the user. We
+  plan to activate it with aggressive defaults during the 0.16 development cycle for
+  testing, and then activate it by default with conservative defaults in the
+  next release.
+* MIB: Starting with version 1.5 of the merlin software, the `ScanX` and `ScanY`
+  fields are included with the acquisition header (:code:`.hdr` file), if the
+  software knows about them. We now try to read these and fall back to the old
+  logic if they are not present (:issue:`1630`, :pr:`1631`).
+* Allow overriding the number of partitions through a parameter
+  :code:`num_partitions` that was added to most :code:`DataSet` implementations.
+  With that expert users can override the number of partitions when loading
+  data, in cases where the default heuristic doesn't work well (:issue:`1701`, :pr:`1702`).
+* Change the number of partitions in case there are fewer frames than
+  workers, where it is an overall advantage to have small (1-frame) partitions
+  instead of aggregating all frames into a single partition, especially if there
+  is a lot of processing done per frame (:issue:`1701`, :pr:`1702`).
+* Add support for Python 3.13 (:pr:`1696`).
+* Add a :ref:`shortcut to generate ROIs <udf roi>` from any numpy-supported slicing (:pr:`1704`):
+
+.. testcode:: run
+
+    roi = dataset.roi[3:7, 9:12]
+    ctx.run_udf(udf=udf, dataset=dataset, roi=roi)
+
+* Adds support for :code:`scipy.sparse.{coo,csr,csc}_array` in addition to
+  :code:`scipy.sparse.{coo,csr,csc}_matrix` through
+  :code:`sparseconverter>=0.4.0` (:pr:`1684`).
+
+Bugfixes
+--------
+
+* Update GMS examples and fix live plotting for GMS 3.61 (:issue:`1418`, :pr:`1712`).
+
+Obsolescence
+------------
+
+* Remove :code:`ClusterDataSet` and :code:`CachedDataSet` since they are
+  under-documented and don't work well; they are fully replacable by filesystem
+  system level caching like fscache. (:pr:`1706`)
+* Remove the holography implementation. It was partly adapted from HyperSpy
+  under GPL v3 and would prevent relicensing of LiberTEM to MIT (:issue:`1649`).
+  Development of holography support in LiberTEM has moved to
+  https://github.com/LiberTEM/LiberTEM-holo. Since the previous code had only
+  few users, and relicensing to MIT should not be delayed, it is removed without
+  deprecation period and will throw an error on import explaining the situation.
+  We recommend that users who depend on the previous code use an older LiberTEM
+  version (<= 0.14.2) for the time being and migrate to the new package when
+  possible. (:pr:`1689`)
+
+Miscellaneous
+-------------
+
+* Replace vector field colormap from :code:`empyre` with custom implementation
+  based on :code:`colorcet` to remove dependency on GPL code (:pr:`1687`, see
+  also :issue:`1649`).
+* LiberTEM has been migrated to use `hatchling` as its build backend and all
+  metadata moved into :code:`pyproject.toml`. (:pr:`1667`)
+
+.. _`v0-14-2`:
+
+0.14.2 / 2025-04-10
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.15191240.svg
+  :target: https://doi.org/10.5281/zenodo.15191240
+
+Support for sparse v0.16.0, and an important bugfix for high idle CPU usage
+(:issue:`1707`, :pr:`1708`).
+
+.. _`v0-14-1`:
+
+0.14.1 / 2024-06-19
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.12168380.svg
+  :target: https://doi.org/10.5281/zenodo.12168380
+
+Support for numpy 2.x. Note that some examples may not yet run, as the
+dependencies might not be numpy 2 compatible. For these cases, please downgrade
+to :code:`numpy<2` (:pr:`1656`, :issue:`1653`).
+
+.. _`v0-14-0`:
+
+0.14.0 / 2024-05-16
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.11204954.svg
+  :target: https://doi.org/10.5281/zenodo.11204954
+
+The 0.14.0 release adds a system for UDFs to be aware of which parts of a
+dataset have already been processed during merging and post-processing,
+and to mark parts of results as invalid when the processing would otherwise
+be incorrect. This feature supports the plotting interface by allowing
+a UDF to mark outliers in results to be ignored, and computations such as
+discrete derivatives where the result at the boundaries of the processed
+data is undefined.
+
+This release also increases the minimum supported Python version to
+3.9 in line with a range of other projects. Older versions of LiberTEM
+remain available in sitations where Python cannot be upgraded.
+
+Many thanks to everyone who has contributed to this release!
+
+Features
+--------
+
+- Add a system for UDFs to be aware of which parts of a
+  dataset have already been processed during merging and
+  post-processing, and mark parts of results as invalid.
+  Documentation for this feature is found `here <https://libertem.github.io/LiberTEM/udf/advanced.html#valid-data-masking>`_.
+  (:issue:`1449` :pr:`1593`).
+- Add a new snooze function to :code:`libertem-server`; the argument
+  :code:`--snooze-timeout` will free resources after a duration of inactivity
+  which is especially useful when deploying LiberTEM as a service on a
+  multi-user system. (:issue:`1570`, :pr:`1572`).
+- In :class:`~libertem.udf.com.CoMUDF`, added `field_y` and `field_x` to results, 
+  which are slices of their respective components in the `field` result (:pr:`1608`).
+
+Bugfixes
+--------
+
+- Fix loading of EMPAD data acquired in "search" mode. In some data sets, the actual raw
+  data acquired corresponds to the :code:`mode="search"` scan parameters,
+  and not :code:`mode="acquire"`. The correct mode can be determined by comparing the file size and file name (:issue:`1617`, :pr:`1620`).
+- Fix the :class:`~libertem.udf.com.CoMUDF` automatic offset and gradient
+  compensation to yield reasonable results during live processing (:pr:`1593`).
+- Manually add MIME type for Javascript on Windows, this is needed to fix
+  setups with an invalid registry entry (:issue:`1612` :pr:`1613`).
+
+Documentation
+-------------
+
+- Describe how to install LiberTEM safely on
+  `air-gapped systems <https://libertem.github.io/LiberTEM/install.html#air-gapped-installation>`_.
+  (:pr:`1627`).
+
+Obsolescence
+------------
+
+- Remove support for Python 3.7 and Python 3.8 following numpy and other
+  projects (:issue:`1606`, :pr:`1607`).
+- The modules :code:`libertem.analysis.gridmatching` and
+  :code:`libertem.analysis.fullmatch` are now available from
+  :mod:`libertem_blobfinder.common.gridmatching` and
+  :mod:`libertem_blobfinder.common.fullmatch` since :mod:`libertem-blobfinder`
+  version 0.6. The original import locations trigger a deprecation warning and
+  are slated for removal in LiberTEM 0.16. (:issue:`1469`, :pr:`1600`).
+
+.. _`v0-13-1`:
+
+0.13.1 / 2023-11-09
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.10091765.svg
+  :target: https://doi.org/10.5281/zenodo.10091765
+
+The 0.13.1 point-release fixes an issue with loading assets when
+connecting to the :code:`libertem-server` web interface via a proxy (:pr:`1554`).
+
+.. _`v0-13-0`:
+
+0.13.0 / 2023-11-09
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.10091431.svg
+  :target: https://doi.org/10.5281/zenodo.10091431
+
+The 0.13.0 release adds a number of improvements to the :code:`libertem-server`
+web interface and its user experience, as well as laying the foundation
+for descan error compensation in all UDFs based on integration over masked
+regions of a frame.
+
+Many thanks to everyone who has contributed to this release!
+
+Web Interface
+-------------
+
+- A progress bar has been added to the web GUI to give feedback on the state of any
+  in-flight computations. (:issue:`1500`, :pr:`1514`)
+- The cluster launcher in the web interface now allows specification
+  of multiple workers-per-GPU, allowing better utilisation of large
+  GPUs. (:issue:`1489`, :pr:`1499`)
+- Direct opening of datasets from URL parameters. The web interface
+  now responds to arguments passed to it by URL, namely instructions
+  to load a particular dataset, e.g. :code:`#action=open&path=/path/to/your/data/`.
+  (:issue:`1085`, :pr:`1518`)
+- When launching :code:`libertem-server` additional parameters are now accepted
+  to preload a cluster with a given number of CPU and GPU workers, and also preload data. See
+  `the libertem-server documentation <https://libertem.github.io/LiberTEM/usage.html#configuring-the-libertem-server-advanced>`_
+  for more detail.(:issue:`1419`, :pr:`1535`)
+
+Descan compensation
+-------------------
+
+- The backend and interface of :code:`ApplyMasksUDF` has been extended to allow
+  compensation for descan error in the form of a :code:`shifts` parameter.
+  The shifts information is used to translate any applied masks
+  relative to the given frame being processed. This lays the groundwork
+  for future support for :code:`shifts` in all UDFs which rely on
+  the backend of :code:`ApplyMasksUDF`, including :code:`CoMUDF` and
+  all virtual imaging analyses. (:pr:`1304`)
+
+UDF Interface
+-------------
+
+- The UDF interface was extended to allow a UDF to declare
+  multiple processing methods (:code:`process_tile`, :code:`process_frame` etc)
+  and choose at runtime the most appropriate one to use. See
+  `the UDF documentation <https://libertem.github.io/LiberTEM/udf/advanced.html#precedence>`_
+  for more detail. (:issue:`1508`, :pr:`1509`)
+
+Misc
+----
+
+- A function :meth:`libertem.contrib.convert_transposed.convert_dm4_transposed`
+  has been added to efficiently convert Gatan Digital Micrograph STEM datasets
+  stored in :code:`(sig, nav)` ordering to numpy .npy files in :code:`(nav, sig)`
+  ordering (:pr:`1520`).
+- Several Exception types were moved to :mod:`libertem.common` for MIT
+  license compatibility. They are re-exported to
+  the old import location for backwards compatibility (:pr:`1543`).
+- The :code:`Shape` class is now hashable allowing it to be used as key
+  in a :code:`dict` and :code:`set`. (:pr:`1507`).
+
+
+.. _`v0-12-0`:
+
+0.12.0 / 2023-08-16
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.8252548.svg
+   :target: https://doi.org/10.5281/zenodo.8252548
+
+The 0.12 release introduces a dedicated Centre-of-Mass analysis UDF
+with additional features compared to the existing
+:meth:`~libertem.api.Context.create_com_analysis()` API. The dedicated
+UDF allows more straightforward live processing support, and can be
+subclassed as in the `LiberTEM-iCoM <https://github.com/LiberTEM/LiberTEM-iCoM>`_
+project.
+
+Also included are two usability improvements aimed at simplifying
+interaction with LiberTEM:
+
+* :code:`ctx.export_dataset()` for conversion of any supported
+  LiberTEM dataset to the Numpy binary format *.npy*.
+* :code:`lt.Context.make_with(cpus=n, gpus=m)` to simplify creation
+  of a LiberTEM :code:`Context` with a specfic number of workers
+  (rather than using all available resources by default).
+
+This release also contains numerous fixes and backend changes
+across the codebase, improving the robustness of support for
+both sparse data and live processing in particular.
+
+Many thanks to everyone who has contributed to this release!
+
+The 0.12.0 release is also the first major release for which
+LiberTEM is available on `conda-forge <https://anaconda.org/conda-forge/libertem>`_.
+See `the installation documentation <https://libertem.github.io/LiberTEM/install.html>`_
+for installation instructions using :code:`pip` or :code:`conda`.
+
+Features
+--------
+
+* Adds :class:`~libertem.udf.com.CoMUDF` as an extension from
+  :meth:`~libertem.api.Context.create_com_analysis`, with support for automatic
+  correction of flat field effects (beam offset and descan
+  error) (:pr:`1392`).
+* Adds :meth:`libertem.api.Context.export_dataset` for export of any supported
+  LiberTEM dataset to another format. At this time only exporting to
+  the Numpy binary fomat *.npy* is supported, but other formats
+  can later be added according to need (:pr:`1379`).
+* The :meth:`libertem.api.Context.make_with` constructor method has been improved
+  to allow simple specification of the number CPU and GPU workers to use,
+  as well as the type of executor to create (:pr:`1443`).
+* Experimental API for dynamic updates to parameters while UDFs
+  are running, allowing for faster feedback loops during live processing,
+  notably (:pr:`1441`).
+
+Miscellaneous
+-------------
+
+* The :class:`~libertem.executor.pipelined.PipelinedExecutor` executor now
+  schedules tasks on the worker with the smallest request queue size (:pr:`1451`).
+* Update :class:`~libertem.executor.pipelined.PipelinedExecutor` to properly
+  match tasks to workers based on resources requested, including GPU workers
+  (:pr:`1453`).
+* Array backend categories are now available in
+  :class:`~libertem.udf.base.UDF` (:pr:`1470`).
+* The UDF runner internals will now raise :class:`~libertem.common.exceptions.UDFRunCancelled`
+  if a UDF run is cancelled, allowing the user to handle this case (:pr:`1448`).
+* Introduce option for :code:`sparse.GCXS` in
+  :class:`~libertem.common.container.MaskContainer` (:pr:`1447`).
+
+Bugfixes
+--------
+
+* We now properly forward the logging level to :code:`dask.distributed` workers
+  during initialization. This prevents a substantial amount of logging
+  information being printed to :code:`stderr` at cluster startup. (:pr:`1438`).
+* When processing *raw_csr* datasets, we now avoid upcasting to
+  float64 when reading an indptr of type uint64 (:pr:`1465`).
+
+Deployment
+----------
+
+* Starting with version 0.12, LiberTEM container images will be available
+  `from the GitHub container registry <https://ghcr.io/libertem/libertem>`_.
+
+
+.. _`v0-11-2`:
+
+0.11.2 / 2023-07-04
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.8114529.svg
+   :target: https://doi.org/10.5281/zenodo.8114529
+
+This point release works around `issue #597 in hdbscan <https://github.com/scikit-learn-contrib/hdbscan/issues/597>`_,
+which is an incompatibility with the latest scikit-learn release 1.3.0.
+
+.. _`v0-11-1`:
+
+0.11.1 / 2023-05-11
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.7924714.svg
+   :target: https://doi.org/10.5281/zenodo.7924714
+
+This point release works around `issue #8940 in numba 0.57.0 <https://github.com/numba/numba/issues/8940>`_,
+which can cause crashes under certain circumstances.
+
+.. _`v0-11-0`:
+
+0.11.0 / 2023-04-21
+###################
+
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.7853070.svg
+   :target: https://doi.org/10.5281/zenodo.7853070
+
+This release introduces first-class support for sparse input data and
+processing using sparse-compatible libraries, primarily oriented towards
+data from event-based detectors. This support is provided through the new
+`sparseconverter <https://github.com/LiberTEM/sparseconverter>`_ package,
+which was developed to enable efficient inter-conversion between different
+sparse formats and dense arrays. Many thanks in particular to Alexander
+Clausen and Dieter Weber for their extensive work on sparse support.
+See :ref:`sparse` for details on how to use it in your UDFs, and :ref:`raw csr`
+for a sparse input file format!
+
+This release also marks the end of official support for Python 3.6
+(:issue:`1369`, :pr:`1380`). At this time the maximum supported Python 
+version remains 3.10 owing to usage of the
+`Numba library <https://numba.pydata.org/>`_ within LiberTEM.
+
+Sparse processing
+-----------------
+* Datasets and UDFs now support tiles in various array formats, in
+  particular :ref:`sparse`. (:issue:`1205`, :pr:`1207`)
+* Add support for :code:`raw_csr` file format (:issue:`1195`, :pr:`1207`).
+* ROIs can now now be provided to :code:`ctx.run_udf` as sparse arrays or coordinate
+  tuples rather than as a dense boolean mask. (:pr:`1306`)
+
+Other features
+--------------
+
+* Single-file Gatan Digital Micrograph (DM3/DM4) STEM datasets are now supported
+  in the API and in the web interface. The files must use the newer C-style
+  ordering available in Digital Micrograph to be read correctly. (:pr:`1401`)
+* The information provided by the :code:`ctx.run_udf` progress bar has been improved
+  with framewise updates, allowing feedback on progress before a partition completes.
+  (:pr:`1341`)
+* HDF5 datasets can now perform on-the-fly reshaping of the scan grid and
+  can be adjusted using the `sync_offset` parameter. (:issue:`441`, :pr:`1364`)
+
+Bugfixes
+--------
+
+* Numerous bugs were fixed in the behaviour of the :code:`PipelinedExecutor`,
+  to avoid crashes and deadlocks throughout the lifecycle of the object,
+  particulary duing live processing.
+  (:pr:`1308`, :pr:`1311`, :pr:`1316`, :pr:`1318`, :pr:`1319`, :pr:`1342`)
+* The :code:`Context` object will now attempt to close itself cleanly at
+  process exit (:pr:`1343`).
+* The handling of :code:`sync_offset`, :code:`nav_shape`, :code:`sig_shape` and
+  :code:`sig_dims` in :class:`libertem.io.dataset.memory.MemoryDataSet` is now
+  consistent with other datasets. (:pr:`1207`)
+* Bugs were fixed in :class:`libertem.udf.stddev.StdDevUDF` for both complex
+  input data and when some partitions are empty.  (:pr:`1314`)
+
+Miscellaneous
+-------------
+
+* Make `self.meta.coordinates` available in `UDF.get_task_data` (:pr:`1397`).
+* The methods :meth:`libertem.executor.pipelined.PipelinedExecutor.make_spec` and
+  :func:`libertem.executor.dask.cluster_spec` both now accept integers for
+  their :code:`cpus` and :code:`cudas` arguments, in addition to the existing
+  iterable forms. (:issue:`1294`, :pr:`1336`).
+* Reduced the overhead of (re-)constructing :code:`Slice` and :code:`Shape`
+  objects when slicing tiles, in particular focused on the method
+  :code:`BufferWrapper.get_contiguous_view_for_tile()`. (:issue:`1313`, :pr:`1321`)
+
+Web interface
+-------------
+
+* Datasets which don't declare their nav shape will be interpreted as square
+  if their number of frames is a square number (:issue:`1309`, :pr:`1338`).
+* Raise if user input for :code:`numWorker` is non-positive integer
+  or other error is encountered in :code:`DaskJobExecutor` creation. (:pr:`1334`).
+* The dataset loader `Reset`` button now correctly resets the sync_offset
+  field, if present (:pr:`1378`).
+* The function :code:`detect` to automatically determine dataset type
+  will now use the file suffix as a hint to choose its search order.
+  This may lead to faster responses in the web client when configuring
+  a new dataset. (:pr:`1377`)
+
+Breaking changes
+----------------
+* Instead of :class:`~libertem.io.dataset.base.tiling.DataTile` objects, an UDF's
+  processing method will receive plain array objects, such as
+  :class:`numpy.ndarray`, :class:`sparse.SparseArray` etc. That means the
+  :code:`scheme_idx` and :code:`tile_slice` attributes are not available from
+  the tile anymore, but only from the corresponding
+  :attr:`libertem.udf.base.UDFMeta.tiling_scheme_idx` and
+  :attr:`libertem.udf.base.UDFMeta.slice`. This change makes handling different
+  array types such as sparse arrays or CuPy arrays easier. For CuPy arrays this
+  was already the previous behavior.
+
 .. _`v0-10-0`:
 
 0.10.0 / 2022-07-28
@@ -47,7 +605,7 @@ New features
 * Integrate :ref:`tracing` that allows to debug and trace distribted operation
   of LiberTEM (:issue:`691`, :pr:`1266`).
 * :code:`libertem-server` picks a free port if the default is in use and no port
-  was specified (:pr:`1184`).
+  was specified (:issue:`1184`, :pr:`1279`).
 * :func:`~libertem.executor.dask.cluster_spec` now accepts the same CUDA device
   ID multiple times to spawn multiple workers on the same GPU. This can help
   increase GPU resource utilisation for some workloads (:pr:`1270`).
@@ -166,7 +724,7 @@ New features
 * New :code:`--preload` option to :code:`libertem-server` and :code:`libertem-worker`.
   That makes it work as documented in :ref:`hdf5`, following
   `Dask worker preloading
-  <https://docs.dask.org/en/stable/how-to/customize-initialization.html#preload-scripts>`_
+  <https://docs.dask.org/en/stable/customize-initialization.html#preload-scripts>`_
   (:pr:`1151`).
 * Allow selection of I/O backend in GUI and Python API (:issue:`753`, :pr:`896,1129`).
 * Re-add support for direct I/O. It was previously only supported as a special

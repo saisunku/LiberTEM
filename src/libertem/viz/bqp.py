@@ -2,7 +2,7 @@ import logging
 
 import numpy as np
 
-from .base import Live2DPlot
+from .base import Live2DPlot, _get_stat_limits
 
 
 logger = logging.getLogger(__name__)
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 class BQLive2DPlot(Live2DPlot):
     """
-    bqplot-image-gl-based live plot (experimental).
+    bqplot-image-gl-based live plot.
 
     .. versionadded:: 0.7.0
 
@@ -73,8 +73,6 @@ class BQLive2DPlot(Live2DPlot):
         # Make sure y points down
         # See https://libertem.github.io/LiberTEM/concepts.html#coordinate-system
         scale_y = LinearScale(min=1, max=0)
-        scales = {'x': scale_x,
-                  'y': scale_y}
         axis_x = Axis(scale=scale_x, label='x')
         axis_y = Axis(scale=scale_y, label='y', orientation='vertical')
 
@@ -82,7 +80,6 @@ class BQLive2DPlot(Live2DPlot):
         aspect = s[1] / s[0]
 
         figure = Figure(
-            scales=scales,
             axes=[axis_x, axis_y],
             scale_x=scale_x,
             scale_y=scale_y,
@@ -112,13 +109,7 @@ class BQLive2DPlot(Live2DPlot):
         dtype = np.result_type(self.data, np.int8)
         # Map on dtype that supports subtraction
         valid_data = self.data[damage].astype(dtype)
-        valid_data = valid_data[np.isfinite(valid_data)]
-        if valid_data.size > 0:
-            mmin = valid_data.min()
-            mmax = valid_data.max()
-        else:
-            mmin = 1
-            mmax = 1 + 1e-12
+        mmin, mmax = _get_stat_limits(valid_data)
         delta = mmax - mmin
         if delta <= 0:
             delta = 1

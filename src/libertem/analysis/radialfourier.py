@@ -4,6 +4,7 @@ from functools import partial
 
 import numpy as np
 import sparse
+import numba
 
 from libertem import masks
 from libertem.common.math import prod
@@ -27,7 +28,7 @@ class RadialTemplate(GeneratorHelper):
     def get_dependency(self):
         return [
             "import matplotlib.cm as cm",
-            "from empyre.vis.colors import ColormapCubehelix, ColormapPerception"
+            "from libertem.viz import rgb_from_2dvector, libertem_cyclic"
         ]
 
     def get_docs(self):
@@ -56,13 +57,12 @@ class RadialTemplate(GeneratorHelper):
         cells.append([
             "imag = radial_result.complex_0_1.raw_data.imag",
             "real = radial_result.complex_0_1.raw_data.real",
-            "ch = ColormapCubehelix(start=1, rot=1, minLight=0.5, maxLight=0.5, sat=2)",
             "fig, axes = plt.subplots()",
             'axes.set_title("complex_0_1")',
-            "plt.imshow(ch.rgb_from_vector((real, imag, 0)))",
+            "plt.imshow(rgb_from_2dvector(x=real, y=imag))",
             "fig, axes = plt.subplots()",
             'axes.set_title("phase_0_1")',
-            'plt.imshow(radial_result.phase_0_1.raw_data, cmap=ColormapPerception())'
+            'plt.imshow(radial_result.phase_0_1.raw_data, cmap=libertem_cyclic)'
         ])
         return ['\n'.join(cell) for cell in cells]
 
@@ -103,6 +103,64 @@ class RadialFourierResultSet(AnalysisResultSet):
     pass
 
 
+def radial_mask_factory(
+        detector_y, detector_x, cx, cy, ri, ro, n_bins, max_order,
+        use_sparse, dtype=np.complex64):
+    dtype = np.result_type(dtype, np.complex64)
+
+    def stack():
+        rings = masks.radial_bins(
+            centerX=cx,
+            centerY=cy,
+            imageSizeX=detector_x,
+            imageSizeY=detector_y,
+            radius=ro,
+            radius_inner=ri,
+            n_bins=n_bins,
+            use_sparse=use_sparse,
+            dtype=dtype
+        )
+
+        orders = np.arange(max_order + 1, dtype=dtype)
+
+        r, phi = masks.polar_map(
+            centerX=cx,
+            centerY=cy,
+            imageSizeX=detector_x,
+            imageSizeY=detector_y
+        )
+        modulator = np.exp(phi.astype(dtype) * orders[:, np.newaxis, np.newaxis] * 1j)
+
+        if use_sparse:
+            rings = rings.reshape((rings.shape[0], 1, *rings.shape[1:]))
+            ring_stack = [rings] * len(orders)
+            ring_stack = sparse.concatenate(ring_stack, axis=1)
+            _radial_mask_product(
+                ring_stack_coords=ring_stack.coords,
+                ring_stack_data_inout=ring_stack.data,
+                modulator=modulator
+            )
+        else:
+            ring_stack = rings[:, np.newaxis, ...] * modulator
+        return ring_stack.reshape((-1, detector_y, detector_x))
+    return stack
+
+
+@numba.njit(cache=True, nogil=True)
+def _radial_mask_product(ring_stack_coords, ring_stack_data_inout, modulator):
+    '''
+    Perform the product between rings and modulator for radial_mask_factory()
+
+    Work on the COO data structure since `sparse` doesn't support
+    efficient sparse-dense product with broadcasting since 0.16, apparently.
+    '''
+    for i in range(ring_stack_data_inout.shape[0]):
+        order = ring_stack_coords[1, i]
+        y = ring_stack_coords[2, i]
+        x = ring_stack_coords[3, i]
+        ring_stack_data_inout[i] *= modulator[order, y, x]
+
+
 class RadialFourierAnalysis(BaseMasksAnalysis, id_="RADIAL_FOURIER"):
     '''
     The Radial Fourier Analysis can be used to characterize
@@ -136,7 +194,7 @@ class RadialFourierAnalysis(BaseMasksAnalysis, id_="RADIAL_FOURIER"):
         udf_results = udf_results.reshape((n_bins, orders, *shape))
 
         def resultlist():
-            from libertem.viz import CMAP_CIRCULAR_DEFAULT, visualize_simple, cmaps
+            from libertem.viz import rgb_from_2dvector, visualize_simple, libertem_cyclic
             import matplotlib.cm as cm
             sets = []
             absolute = np.absolute(udf_results)
@@ -194,7 +252,7 @@ class RadialFourierAnalysis(BaseMasksAnalysis, id_="RADIAL_FOURIER"):
                         AnalysisResult(
                             raw_data=angle[b, o],
                             visualized=partial(visualize_simple,
-                                angle[b, o], colormap=cmaps['perception_circular'],
+                                angle[b, o], colormap=libertem_cyclic,
                                 damage=dam
                             ),
                             key=f"phase_{b}_{o}",
@@ -205,8 +263,8 @@ class RadialFourierAnalysis(BaseMasksAnalysis, id_="RADIAL_FOURIER"):
             for b in range(n_bins):
                 data = udf_results[b, 0]
                 f = partial(
-                    CMAP_CIRCULAR_DEFAULT.rgb_from_vector,
-                    (data.real, data.imag, 0),
+                    rgb_from_2dvector,
+                    x=data.real, y=data.imag,
                     vmax=np.max(np.abs(data[..., dam]))
                 )
                 sets.append(
@@ -221,8 +279,8 @@ class RadialFourierAnalysis(BaseMasksAnalysis, id_="RADIAL_FOURIER"):
                 for o in range(1, orders):
                     data = udf_results[b, o] / normal[b]
                     f = partial(
-                        CMAP_CIRCULAR_DEFAULT.rgb_from_vector,
-                        (data.real, data.imag, 0), vmax=max_absolute
+                        rgb_from_2dvector,
+                        x=data.real, y=data.imag, vmax=max_absolute
                     )
                     sets.append(
                         AnalysisResult(
@@ -243,47 +301,17 @@ class RadialFourierAnalysis(BaseMasksAnalysis, id_="RADIAL_FOURIER"):
         (detector_y, detector_x) = self.dataset.shape.sig
         p = self.parameters
 
-        cx = p['cx']
-        cy = p['cy']
-        ri = p['ri']
-        ro = p['ro']
-        n_bins = p['n_bins']
-        max_order = p['max_order']
-
-        use_sparse = p['use_sparse']
-
-        def stack():
-            rings = masks.radial_bins(
-                centerX=cx,
-                centerY=cy,
-                imageSizeX=detector_x,
-                imageSizeY=detector_y,
-                radius=ro,
-                radius_inner=ri,
-                n_bins=n_bins,
-                use_sparse=use_sparse,
-                dtype=np.complex64
-            )
-
-            orders = np.arange(max_order + 1)
-
-            r, phi = masks.polar_map(
-                centerX=cx,
-                centerY=cy,
-                imageSizeX=detector_x,
-                imageSizeY=detector_y
-            )
-            modulator = np.exp(phi * orders[:, np.newaxis, np.newaxis] * 1j)
-
-            if use_sparse:
-                rings = rings.reshape((rings.shape[0], 1, *rings.shape[1:]))
-                ring_stack = [rings] * len(orders)
-                ring_stack = sparse.concatenate(ring_stack, axis=1)
-                ring_stack *= modulator
-            else:
-                ring_stack = rings[:, np.newaxis, ...] * modulator
-            return ring_stack.reshape((-1, detector_y, detector_x))
-        return stack
+        return radial_mask_factory(
+            detector_y=detector_y,
+            detector_x=detector_x,
+            cx=p['cx'],
+            cy=p['cy'],
+            ri=p['ri'],
+            ro=p['ro'],
+            n_bins=p['n_bins'],
+            max_order=p['max_order'],
+            use_sparse=p['use_sparse'],
+        )
 
     def get_parameters(self, parameters):
         (detector_y, detector_x) = self.dataset.shape.sig

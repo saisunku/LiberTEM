@@ -128,6 +128,7 @@ def test_sync(default_k2is):
 
 
 @needsdata
+@pytest.mark.slow
 def test_read(default_k2is):
     partitions = default_k2is.get_partitions()
     p = next(partitions)
@@ -146,6 +147,8 @@ def test_read(default_k2is):
     t = next(tiles)
     # we get 3D tiles here, because K2IS partitions are inherently 3D
     assert tuple(t.tile_slice.shape) == (16, 930, 16)
+    for _ in tiles:
+        pass
 
 
 @needsdata
@@ -168,6 +171,8 @@ def test_scheme_too_large(default_k2is):
     tiles = p.get_tiles(tiling_scheme=tiling_scheme)
     t = next(tiles)
     assert tuple(t.tile_slice.shape) == tuple((depth,) + default_k2is.shape.sig)
+    for _ in tiles:
+        pass
 
 
 @needsdata
@@ -182,6 +187,7 @@ def test_comparison(default_k2is, default_k2is_raw, lt_ctx_fast):
 
 
 @needsdata
+@pytest.mark.slow
 @pytest.mark.skipif(not HAVE_K2IS_RAWDATA, reason="No K2 IS raw data reference found")
 def test_comparison_roi(default_k2is, default_k2is_raw, lt_ctx_fast):
     roi = np.random.choice(
@@ -259,25 +265,26 @@ def test_read_invalid_tileshape(default_k2is):
 
 @needsdata
 @pytest.mark.slow
-def test_apply_mask_analysis(default_k2is, lt_ctx):
+def test_apply_mask_analysis(default_k2is, local_cluster_ctx):
     mask = np.ones((1860, 2048))
-    analysis = lt_ctx.create_mask_analysis(factories=[lambda: mask], dataset=default_k2is)
-    results = lt_ctx.run(analysis)
+    analysis = local_cluster_ctx.create_mask_analysis(
+        factories=[lambda: mask], dataset=default_k2is,
+    )
+    results = local_cluster_ctx.run(analysis)
     assert results[0].raw_data.shape == (34, 35)
 
 
 @needsdata
-@pytest.mark.slow
-def test_sum_analysis(default_k2is, lt_ctx):
-    analysis = lt_ctx.create_sum_analysis(dataset=default_k2is)
-    results = lt_ctx.run(analysis)
+def test_sum_analysis(default_k2is, local_cluster_ctx):
+    analysis = local_cluster_ctx.create_sum_analysis(dataset=default_k2is)
+    results = local_cluster_ctx.run(analysis)
     assert results[0].raw_data.shape == (1860, 2048)
 
 
 @needsdata
-def test_pick_analysis(default_k2is, lt_ctx):
+def test_pick_analysis(default_k2is, local_cluster_ctx):
     analysis = PickFrameAnalysis(dataset=default_k2is, parameters={"x": 16, "y": 16})
-    results = lt_ctx.run(analysis)
+    results = local_cluster_ctx.run(analysis)
     assert results[0].raw_data.shape == (1860, 2048)
 
 
@@ -516,7 +523,10 @@ def test_regression_simple_stride(lt_ctx, default_k2is):
     )
     print(ts)
     p = list(default_k2is.get_partitions())[-1]
-    next(p.get_tiles(tiling_scheme=ts))
+    tiles = p.get_tiles(tiling_scheme=ts)
+    next(tiles)
+    for _ in tiles:
+        pass
 
 
 @needsdata
@@ -698,3 +708,19 @@ def test_incorrect_sig_shape(lt_ctx):
     assert e.match(
         r"sig_shape must be of size: 3809280"
     )
+
+
+def test_bad_params(ds_params_tester, standard_bad_ds_params):
+    args = ("k2is", K2IS_TESTDATA_PATH)
+    for params in standard_bad_ds_params:
+        ds_params_tester(*args, **params)
+
+
+@needsdata
+def test_num_partitions(lt_ctx):
+    ds = lt_ctx.load(
+        "k2is",
+        path=K2IS_TESTDATA_PATH,
+        num_partitions=129,
+    )
+    assert len(list(ds.get_partitions())) == 129

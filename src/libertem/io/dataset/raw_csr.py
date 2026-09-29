@@ -4,7 +4,6 @@ import os
 import scipy.sparse
 import numpy as np
 import numba
-import tomli
 from sparseconverter import SCIPY_CSR, ArrayBackend, for_backend, NUMPY
 
 from libertem.common import Slice, Shape
@@ -25,9 +24,27 @@ if typing.TYPE_CHECKING:
     import numpy.typing as nt
 
 
+class TOMLError(Exception):
+    # In some versions of tomli, TOMLDecodeError is not picklable, so we use
+    # this custom exception type as a workaround
+    pass
+
+
 def load_toml(path: str):
-    with open(path, "rb") as f:
-        return tomli.load(f)
+    import tomli
+    try:
+        with open(path, "rb") as f:
+            return tomli.load(f)
+    except tomli.TOMLDecodeError as e:
+        msg = str(e)
+    # XXX apparently dask or the libraries used by dask look at the
+    # exceptions that "cause" the final exception, even if we disable
+    # exception chaining. This is a problem if some of these
+    # exceptions aren't pickleable...
+    # If we reached this line, we know the exception case was hit, and
+    # `msg` is set. This is not beautiful, but works around the issue
+    # described above:
+    raise TOMLError(msg)
 
 
 class RawCSRDatasetParams(MessageConverter):
@@ -89,7 +106,8 @@ class RawCSRDataSet(DataSet):
     """
     Read sparse data in compressed sparse row (CSR) format from a triple of files
     that contain the index pointers, the coordinates and the values. See
-    https://en.wikipedia.org/wiki/Sparse_matrix#Compressed_sparse_row_(CSR,_CRS_or_Yale_format)
+    `Wikipedia article on the CSR format
+    <https://en.wikipedia.org/wiki/Sparse_matrix#Compressed_sparse_row_(CSR,_CRS_or_Yale_format)>`_
     for more information on the format.
 
     The necessary parameters are specified in a TOML file like this:
@@ -135,19 +153,33 @@ class RawCSRDataSet(DataSet):
         If negative, number of blank frames to insert at start
     io_backend : IOBackend, optional
         The I/O backend to use, see :ref:`io backends`, by default None.
+    num_partitions: int, optional
+        Override the number of partitions. This is useful if the
+        default number of partitions, chosen based on common workloads,
+        creates partitions which are too large (or small) for the UDFs
+        being run on this dataset.
+
+    Examples
+    --------
+
+    >>> ds = ctx.load("raw_csr", path='./path_to.toml')  # doctest: +SKIP
     """
 
     def __init__(
         self,
         path: str,
-        nav_shape: typing.Optional[typing.Tuple[int, ...]] = None,
-        sig_shape: typing.Optional[typing.Tuple[int, ...]] = None,
+        nav_shape: tuple[int, ...] | None = None,
+        sig_shape: tuple[int, ...] | None = None,
         sync_offset: int = 0,
-        io_backend: typing.Optional["IOBackend"] = None
+        io_backend: typing.Optional["IOBackend"] = None,
+        num_partitions: int | None = None,
     ):
         if io_backend is not None:
             raise NotImplementedError()
-        super().__init__(io_backend=io_backend)
+        super().__init__(
+            io_backend=io_backend,
+            num_partitions=num_partitions,
+        )
         self._path = path
         if nav_shape is not None:
             nav_shape = tuple(nav_shape)
@@ -224,6 +256,10 @@ class RawCSRDataSet(DataSet):
     def check_valid(self) -> bool:
         return True  # TODO
 
+    @staticmethod
+    def _get_filesize(path):
+        return os.stat(path).st_size
+
     def supports_correction(self):
         return False
 
@@ -232,7 +268,7 @@ class RawCSRDataSet(DataSet):
         try:
             _, extension = os.path.splitext(path)
             has_extension = extension.lstrip('.') in cls.get_supported_extensions()
-            under_size_lim = executor.run_function(os.stat, path).st_size < 2**20  # 1 MB
+            under_size_lim = executor.run_function(cls._get_filesize, path) < 2**20  # 1 MB
             if not (has_extension or under_size_lim):
                 return False
             conf = executor.run_function(load_toml, path)
@@ -256,39 +292,43 @@ class RawCSRDataSet(DataSet):
                     "image_count": image_count,
                 }
             }
-        except (TypeError, UnicodeDecodeError, tomli.TOMLDecodeError, OSError):
+        except (TypeError, UnicodeDecodeError, TOMLError, OSError):
             return False
 
     @classmethod
-    def get_msg_converter(cls) -> typing.Type["MessageConverter"]:
+    def get_msg_converter(cls) -> type["MessageConverter"]:
         return RawCSRDatasetParams
 
     def get_diagnostics(self):
-        return []  # TODO: nonzero elements?
+        return [
+            {"name": "data dtype", "value": str(self._descriptor.data_dtype)},
+            {"name": "indptr dtype", "value": str(self._descriptor.indptr_dtype)},
+            {"name": "indices dtype", "value": str(self._descriptor.indices_dtype)},
+        ]  # TODO: nonzero elements?
 
     @classmethod
-    def get_supported_extensions(cls) -> typing.Set[str]:
+    def get_supported_extensions(cls) -> set[str]:
         return {"toml"}
 
     def get_cache_key(self) -> str:
         raise NotImplementedError()  # TODO
 
     @classmethod
-    def get_supported_io_backends(cls) -> typing.List[str]:
+    def get_supported_io_backends(cls) -> list[str]:
         return []  # FIXME: we may want to read using a backend in the future
 
     def adjust_tileshape(
         self,
-        tileshape: typing.Tuple[int, ...],
-        roi: typing.Optional[np.ndarray]
-    ) -> typing.Tuple[int, ...]:
+        tileshape: tuple[int, ...],
+        roi: np.ndarray | None
+    ) -> tuple[int, ...]:
         return (tileshape[0],) + tuple(self._sig_shape)
 
     def need_decode(
         self,
         read_dtype: "nt.DTypeLike",
-        roi: typing.Optional[np.ndarray],
-        corrections: typing.Optional[CorrectionSet]
+        roi: np.ndarray | None,
+        corrections: CorrectionSet | None
     ) -> bool:
         return super().need_decode(read_dtype, roi, corrections)
 
@@ -322,7 +362,7 @@ class RawCSRPartition(Partition):
         self._worker_context = None
         super().__init__(*args, **kwargs)
 
-    def set_corrections(self, corrections: typing.Optional[CorrectionSet]):
+    def set_corrections(self, corrections: CorrectionSet | None):
         if corrections is not None and corrections.have_corrections():
             raise NotImplementedError("corrections not implemented for raw CSR data set")
 
@@ -339,7 +379,7 @@ class RawCSRPartition(Partition):
         tiling_scheme: TilingScheme,
         dest_dtype="float32",
         roi=None,
-        array_backend: typing.Optional[ArrayBackend] = None
+        array_backend: ArrayBackend | None = None
     ):
         assert array_backend == SCIPY_CSR or array_backend is None
         tiling_scheme = tiling_scheme.adjust_for_partition(self)
@@ -571,8 +611,11 @@ def read_tiles_with_roi(
         # Don't read empty slices
         if indptr_stop - indptr_start <= 0:
             continue
-        indptr_tile_start = start_values[indptr_start:indptr_stop]
-        indptr_tile_stop = stop_values[indptr_start:indptr_stop]
+        # Cast to int64 to avoid later upcasting to float64 in case of uint64
+        # We can safely assume that files have less than 2**63 entries so that casting
+        # from uint64 to int64 should be safe
+        indptr_tile_start = start_values[indptr_start:indptr_stop].astype(np.int64)
+        indptr_tile_stop = stop_values[indptr_start:indptr_stop].astype(np.int64)
         size = sum(indptr_tile_stop - indptr_tile_start)
 
         data = np.zeros(dtype=dest_dtype, shape=size)

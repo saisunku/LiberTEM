@@ -9,6 +9,7 @@ import pytest
 import numpy as np
 import numba
 
+from libertem.api import Context
 from libertem.common.numba import rmatmul, numba_dtypes
 from libertem.common.numba.cache import _cached_njit_reg
 from libertem.web.dataset import prime_numba_cache
@@ -113,3 +114,17 @@ def test_numba_dtype(dtype):
     res = numba_sum(arr)
     assert arr.dtype in numba_dtypes
     assert res == len(arr)
+
+
+@numba.njit
+def _issue_1432():
+    np.array([1 for _ in range(1)])
+
+
+@pytest.mark.slow
+def test_issue_1432():
+    from libertem.executor.dask import cluster_spec, DaskJobExecutor
+    spec = cluster_spec(cpus=1, cudas=[], has_cupy=False, num_service=0)
+    executor = DaskJobExecutor.make_local(spec=spec)
+    with Context(executor=executor) as ctx:
+        print(ctx.executor.run_function(_issue_1432))

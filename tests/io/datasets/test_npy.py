@@ -258,8 +258,8 @@ def test_positive_sync_offset(lt_ctx, npy_8x8x8x8_ds, npy_8x8x8x8_path, io_backe
         path=npy_8x8x8x8_path,
         sync_offset=sync_offset,
         io_backend=io_backend,
+        num_partitions=4,
     )
-    ds_with_offset.set_num_cores(4)
     ds_with_offset = ds_with_offset.initialize(lt_ctx.executor)
     ds_with_offset.check_valid()
 
@@ -276,8 +276,11 @@ def test_positive_sync_offset(lt_ctx, npy_8x8x8x8_ds, npy_8x8x8x8_path, io_backe
         dataset_shape=ds_with_offset.shape,
     )
 
-    t0 = next(p0.get_tiles(tiling_scheme))
+    tiles = p0.get_tiles(tiling_scheme)
+    t0 = next(tiles)
     assert tuple(t0.tile_slice.origin) == (0, 0, 0)
+    for _ in tiles:
+        pass
 
     for p in ds_with_offset.get_partitions():
         for t in p.get_tiles(tiling_scheme=tiling_scheme):
@@ -311,8 +314,8 @@ def test_negative_sync_offset(lt_ctx, npy_8x8x8x8_ds, npy_8x8x8x8_path, io_backe
         path=npy_8x8x8x8_path,
         sync_offset=sync_offset,
         io_backend=io_backend,
+        num_partitions=4,
     )
-    ds_with_offset.set_num_cores(4)
     ds_with_offset = ds_with_offset.initialize(lt_ctx.executor)
     ds_with_offset.check_valid()
 
@@ -329,8 +332,11 @@ def test_negative_sync_offset(lt_ctx, npy_8x8x8x8_ds, npy_8x8x8x8_path, io_backe
         dataset_shape=ds_with_offset.shape,
     )
 
-    t0 = next(p0.get_tiles(tiling_scheme))
+    tiles = p0.get_tiles(tiling_scheme)
+    t0 = next(tiles)
     assert tuple(t0.tile_slice.origin) == (2, 0, 0)
+    for _ in tiles:
+        pass
 
     for p in ds_with_offset.get_partitions():
         for t in p.get_tiles(tiling_scheme=tiling_scheme):
@@ -360,6 +366,14 @@ def test_load_direct(lt_ctx, npy_8x8x8x8_path):
     )
     analysis = lt_ctx.create_sum_analysis(dataset=ds_direct)
     lt_ctx.run(analysis)
+
+
+def test_no_num_partitions(lt_ctx, npy_8x8x8x8_path):
+    ds = lt_ctx.load(
+        "npy",
+        path=npy_8x8x8x8_path,
+    )
+    lt_ctx.run_udf(dataset=ds, udf=SumSigUDF())
 
 
 @pytest.mark.parametrize(
@@ -455,3 +469,13 @@ def test_correction_default(default_npy, lt_ctx, with_roi):
         roi = None
 
     dataset_correction_verification(ds=ds, roi=roi, lt_ctx=lt_ctx)
+
+
+def test_diagnostics(default_npy):
+    assert {"name": "dtype", "value": "float32"} in default_npy.get_diagnostics()
+
+
+def test_bad_params(ds_params_tester, standard_bad_ds_params, default_npy):
+    args = ("npy", default_npy._path)
+    for params in standard_bad_ds_params:
+        ds_params_tester(*args, **params)

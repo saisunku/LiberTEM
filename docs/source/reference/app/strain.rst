@@ -19,12 +19,8 @@ Blobfinder
 Matching
 --------
 
-These modules contain classes and helper functions that extract and manipulate lattices from correlation results.
-
-.. automodule:: libertem.analysis.gridmatching
-   :members:
-   :show-inheritance:
-
-.. automodule:: libertem.analysis.fullmatch
-   :members:
-   :show-inheritance:
+.. deprecated:: 0.14.0
+   The modules :code:`libertem.analysis.gridmatching` and :code:`libertem.analysis.fullmatch`
+   that contain classes and helper functions to extract and manipulate lattices from correlation results
+   are moved to :mod:`libertem_blobfinder.common.gridmatching` and :mod:`libertem_blobfinder.common.fullmatch`
+   since :mod:`libertem-blobfinder` version 0.6, and are slated for removal in LiberTEM 0.16.

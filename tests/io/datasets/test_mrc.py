@@ -256,3 +256,22 @@ def test_scheme_too_large(default_mrc):
     tiles = p.get_tiles(tiling_scheme=tiling_scheme)
     t = next(tiles)
     assert tuple(t.tile_slice.shape) == tuple((depth,) + default_mrc.shape.sig)
+
+
+def test_diagnostics(default_mrc):
+    assert {"name": "dtype", "value": "float32"} in default_mrc.get_diagnostics()
+
+
+def test_bad_params(ds_params_tester, standard_bad_ds_params):
+    args = ("mrc", MRC_TESTDATA_PATH)
+    for params in standard_bad_ds_params:
+        ds_params_tester(*args, **params)
+
+
+def test_num_partitions(lt_ctx):
+    ds = lt_ctx.load(
+        "mrc",
+        path=MRC_TESTDATA_PATH,
+        num_partitions=3,
+    )
+    assert len(list(ds.get_partitions())) == 3

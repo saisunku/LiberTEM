@@ -26,7 +26,7 @@ Installing from a git clone
 
 .. note::
     Distinguish between installing a released version and installing the latest
-    development version. Both :ref:`installing from PyPI` and :ref:`installing from a git
+    development version. Both :ref:`installing from PyPI <installation>` and :ref:`installing from a git
     clone` use pip, but they do fundamentally different things. :code:`python -m pip
     install libertem` downloads the latest release from PyPI.
 
@@ -45,7 +45,7 @@ If you want to follow the latest development, you should install LiberTEM from
 a git clone. As a prerequisite, you need to have git installed on your system. On Linux,
 we suggest using the git package that comes with your package manager. On Windows, you can use one
 of the many available clients, like  `git for windows <https://gitforwindows.org/>`_, 
-`GitHub Desktop <https://desktop.github.com/>`_, `TortoiseGit <https://tortoisegit.org/>`_,
+`GitHub Desktop <https://github.com/apps/desktop>`_, `TortoiseGit <https://tortoisegit.org/>`_,
 or the git integration of your development environment.
 
 .. code-block:: shell
@@ -70,7 +70,7 @@ by following these steps:
     $ git clone https://github.com/your-user-name/LiberTEM
 
 More information about `forking a repository
-<https://docs.github.com/en/get-started/quickstart/fork-a-repo>`_.
+<https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/fork-a-repo>`_.
 For a beginner-friendly introduction to git and GitHub, consider going through
 the following resources:
 
@@ -78,8 +78,7 @@ the following resources:
   covers the essentials of using Git.
 * Practice `pull request <https://github.com/firstcontributions/first-contributions>`_
   in a safe sandbox environment.
-* Sample `workflow <https://docs.astropy.org/en/latest/development/workflow/development_workflow.html>`_
-  for contributing code.
+* Detailed `documentation for contributing to astropy <https://docs.astropy.org/en/latest/index_dev.html>`_.
 
 Activate the Python environment (conda or virtualenv) and change to the newly
 created directory with the clone of the LiberTEM repository. Now you can start
@@ -97,7 +96,7 @@ Installing extra dependencies works just like when installing LiberTEM from PyPI
 
 .. code-block:: shell
 
-    (libertem) $ python -m pip install -e .[torch,hdbscan,cupy]
+    (libertem) $ python -m pip install -e .[torch,cupy]
 
 Updating
 ~~~~~~~~
@@ -119,6 +118,10 @@ requirements for installed third-party packages have changed, you should re-run
 Setting up tox on Windows
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
+.. note::
+  This doesn't seem to work on the newest tox major release 4.x anymore.
+  We are still figuring out how to make it work. Help is appreciated!
+
 We are using tox to run our tests.
 On Windows with Anaconda, you have to create named aliases for the Python
 interpreter before you can run :literal:`tox` so that tox finds the python
@@ -135,15 +138,15 @@ environment base folder, typically
     REM execute python.exe with the same command line
     @python.exe %*
 
-To execute tests with Python 3.7, you create a new environment with Python 3.7:
+To execute tests with Python 3.12, you create a new environment with Python 3.12:
 
 .. code-block:: shell
 
-    > conda create -n libertem-3.7 python=3.7
+    > conda create -n libertem-3.12 python=3.12
 
-Now you can create :literal:`python3.7.bat` in your normal LiberTEM environment
+Now you can create :literal:`python3.12.bat` in your normal LiberTEM environment
 alongside :literal:`python3.9.bat` and make it execute the Python interpreter of
-your new libertem-3.7 environment:
+your new libertem-3.12 environment:
 
 .. code-block:: bat
 
@@ -151,7 +154,7 @@ your new libertem-3.7 environment:
     REM @echo off is vital so that the file doesn't clutter the output
     REM execute python.exe in a different environment
     REM with the same command line
-    @%LOCALAPPDATA%\conda\conda\envs\libertem-3.7\python.exe %*
+    @%LOCALAPPDATA%\conda\conda\envs\libertem-3.12\python.exe %*
 
 See also:
-https://tox.wiki/en/latest/developers.html#multiple-python-versions-on-windows
+https://tox.wiki/en/3.0.0/developers.html#id2

@@ -1,13 +1,17 @@
 import re
 import os
+import platform
 from glob import glob, escape
 import logging
-from typing import TYPE_CHECKING, Generator, List, Optional, Sequence, Tuple, Union
-from typing_extensions import Literal, TypedDict
+from typing import TYPE_CHECKING, Literal
+from typing_extensions import TypedDict
+from collections.abc import Generator, Sequence
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 from numba.typed import List as NumbaList
 import numba
+import psutil
 import numpy as np
 
 from libertem.common.math import prod, make_2D_square, flat_nonzero
@@ -92,6 +96,8 @@ def is_valid_hdr(path):
 
 
 def nav_shape_from_hdr(hdr):
+    if 'ScanX' in hdr and 'ScanY' in hdr:
+        return (int(hdr['ScanY']), int(hdr['ScanX']))
     num_frames, scan_x = (
         int(hdr['Frames in Acquisition (Number)']),
         int(hdr['Frames per Trigger (Number)'])
@@ -114,7 +120,7 @@ def _pattern(path: str) -> str:
     return pattern
 
 
-def get_filenames(path: str, disable_glob=False) -> List[str]:
+def get_filenames(path: str, disable_glob=False) -> list[str]:
     if disable_glob:
         return [path]
     else:
@@ -128,12 +134,13 @@ def _get_sequence(f: "MIBHeaderReader"):
 def get_image_count_and_sig_shape(
     path: str,
     disable_glob: bool = False,
-) -> Tuple[int, Tuple[int, int]]:
+) -> tuple[int, tuple[int, int]]:
     fns = get_filenames(path, disable_glob=disable_glob)
+    headers = MIBDataSet._preread_headers(fns)
     count = 0
     files = []
-    for path in fns:
-        f = MIBHeaderReader(path)
+    for path, fields in headers.items():
+        f = MIBHeaderReader(path, fields=fields)
         count += f.fields['num_images']
         files.append(f)
     try:
@@ -155,15 +162,15 @@ def encode_u1(inp, out):
         out[y] = inp[y]
 
 
-@numba.jit(cache=True)
+@numba.njit(cache=True)
 def encode_u2(inp, out):
     for y in range(out.shape[0]):
         row_out = out[y]
         row_in = inp[y]
         for i in range(row_in.shape[0]):
             in_value = row_in[i]
-            row_out[i * 2] = (0xFF00 & in_value) >> 8
-            row_out[i * 2 + 1] = 0xFF & in_value
+            row_out[i * 2] = (0xFF00 & np.uint16(in_value)) >> 8
+            row_out[i * 2 + 1] = 0xFF & np.uint16(in_value)
 
 
 @numba.njit(cache=True)
@@ -176,7 +183,7 @@ def encode_r1(inp, out):
                 out_byte = 0
                 for bitpos in range(8):
                     value = row_in[64 * stripe + 8 * byte + bitpos] & 1
-                    out_byte |= (value << bitpos)
+                    out_byte |= (np.uint64(value) << bitpos)
                 row_out[(stripe + 1) * 8 - (byte + 1)] = out_byte
 
 
@@ -573,14 +580,16 @@ def decode_r12_swap_2x2(inp, out, idx, native_dtype, rr, origin, shape, ds_shape
             col = i % 4
             pos = i // 4
             out_pos = (pos + 1) * 4 - col - 1
-            out_cut[out_pos] = (inp[i * 2] << 8) + (inp[i * 2 + 1] << 0)
+            out_cut[out_pos] = (np.uint16(inp[i * 2]) << 8) + (inp[i * 2 + 1] << 0)
     else:
         # flip in x direction:
         for i in range(out_cut.shape[0]):
             col = i % 4
             pos = i // 4
             out_pos = (pos + 1) * 4 - col - 1
-            out_cut[out_cut.shape[0] - out_pos - 1] = (inp[i * 2] << 8) + (inp[i * 2 + 1] << 0)
+            out_cut[out_cut.shape[0] - out_pos - 1] = (
+                (np.uint16(inp[i * 2]) << 8) + (inp[i * 2 + 1] << 0)
+            )
 
     # reference non-quad impl:
     # for i in range(out.shape[1]):
@@ -595,7 +604,7 @@ mib_2x2_get_read_ranges = make_get_read_ranges(
 )
 
 
-@numba.jit(inline='always', cache=True)
+@numba.njit(inline='always', cache=True)
 def decode_r1_swap(inp, out, idx, native_dtype, rr, origin, shape, ds_shape):
     """
     RAW 1bit format: each pixel is actually saved as a single bit. 64 bits
@@ -631,7 +640,7 @@ def decode_r12_swap(inp, out, idx, native_dtype, rr, origin, shape, ds_shape):
         col = i % 4
         pos = i // 4
         out_pos = (pos + 1) * 4 - col - 1
-        out[idx, out_pos] = (inp[i * 2] << 8) + (inp[i * 2 + 1] << 0)
+        out[idx, out_pos] = (np.uint16(inp[i * 2]) << 8) + (np.uint16(inp[i * 2 + 1]) << 0)
 
 
 @numba.njit(inline='always', cache=True)
@@ -650,7 +659,7 @@ def decode_r24_swap(inp, out, idx, native_dtype, rr, origin, shape, ds_shape):
         col = i % 4
         pos = i // 4
         out_pos = (pos + 1) * 4 - col - 1
-        out_val = np.uint32((inp[i * 2] << 8) + (inp[i * 2 + 1] << 0))
+        out_val = np.uint32((np.uint32(inp[i * 2]) << 8) + (np.uint32(inp[i * 2 + 1]) << 0))
         if idx % 2 == 0:  # from first frame: most significant bits
             out_val = out_val << 12
         out[idx // 2, out_pos] += out_val
@@ -732,20 +741,20 @@ class HeaderDict(TypedDict):
     mib_dtype: str
     mib_kind: MIBKind
     bits_per_pixel: int
-    image_size: Tuple[int, int]
+    image_size: tuple[int, int]
     image_size_bytes: int
     sequence_first_image: int
     filesize: int
     num_images: int
     num_chips: int
-    sensor_layout: Tuple[int, int]
+    sensor_layout: tuple[int, int]
 
 
 class MIBHeaderReader:
     def __init__(
         self,
         path: str,
-        fields: Optional[HeaderDict] = None,
+        fields: HeaderDict | None = None,
         sequence_start: int = 0,
     ):
         self.path = path
@@ -758,7 +767,8 @@ class MIBHeaderReader:
     def __repr__(self) -> str:
         return "<MIBHeaderReader: %s>" % self.path
 
-    def _get_np_dtype(self, dtype: str, bit_depth: int) -> "nt.DTypeLike":
+    @staticmethod
+    def _get_np_dtype(dtype: str, bit_depth: int) -> "nt.DTypeLike":
         dtype = dtype.lower()
         num_bits = int(dtype[1:])
         if dtype[0] == "u":
@@ -777,16 +787,25 @@ class MIBHeaderReader:
             raise NotImplementedError(f"unknown dtype: {dtype}")
 
     def read_header(self) -> HeaderDict:
+        header, filesize = self._read_header_bytes(self.path)
+        self._fields = self._parse_header_bytes(header, filesize)
+        return self._fields
+
+    @staticmethod
+    def _read_header_bytes(path) -> tuple[bytes, int]:
         # FIXME: do this read via the IO backend!
-        with open(file=self.path, encoding="ascii", errors='ignore') as f:
-            header = f.read(1024)
+        with open(file=path, mode='rb') as f:
             filesize = os.fstat(f.fileno()).st_size
+            return f.read(1024), filesize
+
+    @staticmethod
+    def _parse_header_bytes(header: bytes, filesize: int) -> HeaderDict:
+        header: str = header.decode(encoding='ascii', errors='ignore')
         parts = header.split(",")
         header_size_bytes = int(parts[2])
         parts = [p
                 for p in header[:header_size_bytes].split(",")
                 if '\x00' not in p]
-        self._header_parts = parts
         dtype = parts[6].lower()
         mib_kind: Literal['u', 'r']
         # To make mypy Literal check happy...
@@ -857,9 +876,9 @@ class MIBHeaderReader:
                         f"(original image size: {image_size_orig})"
                     )
 
-        self._fields = {
+        return {
             'header_size_bytes': header_size_bytes,
-            'dtype': self._get_np_dtype(parts[6], bits_per_pixel_raw),
+            'dtype': MIBHeaderReader._get_np_dtype(parts[6], bits_per_pixel_raw),
             'mib_dtype': dtype,
             'mib_kind': mib_kind,
             'bits_per_pixel': bits_per_pixel_raw,
@@ -871,7 +890,6 @@ class MIBHeaderReader:
             'num_chips': num_chips,
             'sensor_layout': sensor_layout,
         }
-        return self._fields
 
     @property
     def num_frames(self) -> int:
@@ -879,7 +897,15 @@ class MIBHeaderReader:
 
     @property
     def start_idx(self) -> int:
-        return self.fields['sequence_first_image'] - self._sequence_start
+        return self.fields['sequence_first_image'] - self.sequence_start
+
+    @property
+    def sequence_start(self) -> int | None:
+        return self._sequence_start
+
+    @sequence_start.setter
+    def sequence_start(self, val: int):
+        self._sequence_start = val
 
     @property
     def fields(self) -> HeaderDict:
@@ -920,7 +946,7 @@ class MIBFileSet(FileSet):
     def get_read_ranges(
         self, start_at_frame: int, stop_before_frame: int,
         dtype, tiling_scheme: TilingScheme, sync_offset: int = 0,
-        roi: Union[np.ndarray, None] = None,
+        roi: np.ndarray | None = None,
     ):
         fileset_arr = self.get_as_arr()
         bit_depth = self._header['bits_per_pixel']
@@ -1018,12 +1044,31 @@ class MIBDataSet(DataSet):
         (for example, a.mib, a1.mib and a2.mib), loading a.mib would include a1.mib and a2.mib
         in the data set. Setting :code:`disable_glob` to :code:`True` will only load the single
         .mib file specified as :code:`path`.
+
+    num_partitions: int, optional
+        Override the number of partitions. This is useful if the
+        default number of partitions, chosen based on common workloads,
+        creates partitions which are too large (or small) for the UDFs
+        being run on this dataset.
     """
-    def __init__(self, path, tileshape=None, scan_size=None, disable_glob=False,
-                 nav_shape=None, sig_shape=None, sync_offset=0, io_backend=None):
-        super().__init__(io_backend=io_backend)
+    def __init__(
+        self,
+        path,
+        tileshape=None,
+        scan_size=None,
+        disable_glob=False,
+        nav_shape=None,
+        sig_shape=None,
+        sync_offset=0,
+        io_backend=None,
+        num_partitions=None,
+    ):
+        super().__init__(
+            io_backend=io_backend,
+            num_partitions=num_partitions,
+        )
         self._sig_dims = 2
-        self._path = path
+        self._path = str(path)
         self._nav_shape = tuple(nav_shape) if nav_shape else nav_shape
         self._sig_shape = tuple(sig_shape) if sig_shape else sig_shape
         self._sync_offset = sync_offset
@@ -1041,15 +1086,13 @@ class MIBDataSet(DataSet):
             if nav_shape is not None:
                 raise ValueError("cannot specify both scan_size and nav_shape")
             self._nav_shape = tuple(scan_size)
-        if self._nav_shape is None and not path.lower().endswith(".hdr"):
+        if self._nav_shape is None and not self._path.lower().endswith(".hdr"):
             raise ValueError(
                     "either nav_shape needs to be passed, or path needs to point to a .hdr file"
                 )
         self._filename_cache = None
-        self._files_sorted: Optional[Sequence[MIBHeaderReader]] = None
-        # ._preread_headers() calls ._files() which passes the cached headers down to
-        # MIBHeaderReader, if they exist. So we need to make sure to initialize self._headers
-        # before calling _preread_headers!
+        self._files_sorted: Sequence[MIBHeaderReader] | None = None
+        # ._preread_headers() in _do_initialize() filles self._headers
         self._headers = {}
         self._meta = None
         self._total_filesize = None
@@ -1057,7 +1100,8 @@ class MIBDataSet(DataSet):
         self._disable_glob = disable_glob
 
     def _do_initialize(self):
-        self._headers = self._preread_headers()
+        filenames = self._filenames()
+        self._headers = self._preread_headers(filenames)
         self._files_sorted = list(sorted(self._files(),
                                          key=lambda f: f.fields['sequence_first_image']))
 
@@ -1065,6 +1109,13 @@ class MIBDataSet(DataSet):
             first_file = self._files_sorted[0]
         except IndexError:
             raise DataSetException("no files found")
+
+        self._sequence_start = first_file.fields['sequence_first_image']
+        # _files_sorted is initially created with _sequence_start = None
+        # now that we know the first file we can set the correct value
+        for f in self._files_sorted:
+            f.sequence_start = self._sequence_start
+
         if self._nav_shape is None:
             hdr = read_hdr_file(self._path)
             self._nav_shape = nav_shape_from_hdr(hdr)
@@ -1078,12 +1129,9 @@ class MIBDataSet(DataSet):
         shape = Shape(self._nav_shape + self._sig_shape, sig_dims=self._sig_dims)
         dtype = first_file.fields['dtype']
         self._total_filesize = sum(
-            os.stat(path).st_size
-            for path in self._filenames()
+            f.fields['filesize']
+            for f in self._files_sorted
         )
-        self._sequence_start = first_file.fields['sequence_first_image']
-        self._files_sorted = list(sorted(self._files(),
-                                         key=lambda f: f.fields['sequence_first_image']))
         self._image_count = self._num_images()
         self._nav_shape_product = int(prod(self._nav_shape))
         self._sync_offset_info = self.get_sync_offset_info()
@@ -1143,33 +1191,51 @@ class MIBDataSet(DataSet):
             }
         }
 
-    def _preread_headers(self):
+    @staticmethod
+    def _preread_headers(filenames):
+        # Avoid overhead of creating the Pool on low-file-count datasets
+        if len(filenames) > 512:
+            # Default ThreadPoolExecutor allocates 5 threads per CPU on the machine
+            # In testing this was found to be far too many on Linux, and sometimes
+            # a good number on Windows but sometimes too many
+            max_workers = 2
+            if platform.system() == "Windows":
+                num_cores = psutil.cpu_count(logical=False)
+                max_workers = max(max_workers, int(num_cores * 0.5))
+            with ThreadPoolExecutor(max_workers=max_workers) as p:
+                header_and_size = p.map(MIBHeaderReader._read_header_bytes, filenames)
+        else:
+            header_and_size = tuple(map(MIBHeaderReader._read_header_bytes, filenames))
+
         res = {}
-        for f in self._files():
-            res[f.path] = f.fields
+        for path, (header, filesize) in zip(filenames, header_and_size):
+            res[path] = MIBHeaderReader._parse_header_bytes(header, filesize)
         return res
 
     def _filenames(self):
         if self._filename_cache is not None:
             return self._filename_cache
         fns = get_filenames(self._path, disable_glob=self._disable_glob)
-        if len(fns) > 16384:
+        num_files = len(fns)
+        if num_files > 16384:
             warnings.warn(
-                "Saving data in many small files (here: %d) is not efficient, please increase "
-                "the \"Images Per File\" parameter when acquiring data",
+                f"Saving data in many small files (here: {num_files}) is not efficient, "
+                "please increase the \"Images Per File\" parameter when acquiring data. If "
+                "this leads to \"Too many open files\" errors, on POSIX systems you can increase "
+                "the maximum open files limit using the \"ulimit\" shell command.",
                 RuntimeWarning
             )
         self._filename_cache = fns
         return fns
 
     def _files(self) -> Generator[MIBHeaderReader, None, None]:
-        for path in self._filenames():
-            f = MIBHeaderReader(path, fields=self._headers.get(path),
+        for path, fields in self._headers.items():
+            f = MIBHeaderReader(path, fields=fields,
                         sequence_start=self._sequence_start)
             yield f
 
     def _num_images(self):
-        return sum(f.fields['num_images'] for f in self._files())
+        return sum(f.fields['num_images'] for f in self._files_sorted)
 
     @property
     def dtype(self):
@@ -1221,7 +1287,7 @@ class MIBDataSet(DataSet):
             for f in self._files_sorted
         ], header=first_file.fields, frame_header_bytes=header_size)
 
-    def get_base_shape(self, roi: Optional[np.ndarray]) -> Tuple[int, ...]:
+    def get_base_shape(self, roi: np.ndarray | None) -> tuple[int, ...]:
         # With R-mode files, we are constrained to tile sizes that are a
         # multiple of 64px in the fastest dimension!
         # If we make sure full "x-lines" are taken, we are fine (this is the

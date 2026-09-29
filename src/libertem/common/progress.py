@@ -1,6 +1,9 @@
 import threading
-from typing import TYPE_CHECKING, Iterable, Dict, Callable, List, Any, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, NamedTuple
+from collections.abc import Callable
+from collections.abc import Iterable
 import time
+
 from libertem.common.executor import WorkerQueueEmpty
 
 
@@ -25,7 +28,7 @@ class CommsDispatcher:
     feature, which has a similar message => topic => callback
     model running in the client event loop
     """
-    def __init__(self, queue: 'WorkerQueue', subscriptions: Dict[str, List[Callable]]):
+    def __init__(self, queue: 'WorkerQueue', subscriptions: dict[str, list[Callable]]):
         self._message_q = queue
         self._subscriptions = subscriptions
         self._thread = None
@@ -33,7 +36,11 @@ class CommsDispatcher:
     def __enter__(self, *args, **kwargs):
         if self._thread is not None:
             raise RuntimeError('Cannot re-enter CommsDispatcher')
-        self._thread = threading.Thread(target=self.monitor_queue)
+        self._thread = threading.Thread(
+            target=self.monitor_queue,
+            name="CommsDispatcher",
+        )
+        self._thread.daemon = True
         self._thread.start()
 
     def __exit__(self, *args, **kwargs):
@@ -52,7 +59,10 @@ class CommsDispatcher:
 
     def monitor_queue(self):
         """
-        Monitor the queue for messages
+        Monitor the queue for messages. This runs as a background thread of the
+        main process, and forwards messages from the message queue to all
+        subscribers via the registered callback functions.
+
         If there are no subscribers this should drain
         messages from the queue as fast as they are recieved
         """
@@ -222,8 +232,9 @@ class TQDMProgressReporter(ProgressReporter):
 
 class ProgressManager:
     """
-    Handle construction and updating of a tqdm.tqdm progress bar
-    for a set of UDFTasks, to be completed in any order
+    Handle updating of a progress reporter for a set of :code:`UDFTasks`, to be
+    completed in any order. By default constructs a
+    :code:`TQDMProgressReporter`, if no instance is passed in.
 
     The bar displays as such:
 
@@ -240,7 +251,7 @@ class ProgressManager:
         self,
         tasks: Iterable['UDFTask'],
         progress_id: str,
-        reporter: Optional[ProgressReporter] = None,
+        reporter: ProgressReporter | None = None,
     ):
         if not tasks:
             raise ValueError('Cannot display progress for empty tasks')
@@ -308,7 +319,7 @@ class ProgressManager:
         comms.subscribe('partition_complete', self.handle_end_task)
         comms.subscribe('tile_complete', self.handle_tile_update)
 
-    def handle_start_task(self, topic: str, message: Dict[str, Any]):
+    def handle_start_task(self, topic: str, message: dict[str, Any]):
         """
         Increment the num_in_progress counter
 
@@ -327,7 +338,7 @@ class ProgressManager:
             self._in_progress.add(t_id)
         self.reporter.update(self.state)
 
-    def handle_end_task(self, topic: str, message: Dict[str, Any]):
+    def handle_end_task(self, topic: str, message: dict[str, Any]):
         """
         Increment the counter for the task to the max value
         and update the various counters / description
@@ -342,10 +353,10 @@ class ProgressManager:
         self._complete.add(t_id)
         self.reporter.update(self.state)
 
-    def handle_tile_update(self, topic: str, message: Dict[str, Any]):
+    def handle_tile_update(self, topic: str, message: dict[str, Any]):
         """
         Update the frame progress counter for the task
-        and push the increment to the tqdm bar
+        and push the increment to the progress reporter
 
         Tile stacks are converted to pseudo-frames via the sig_size
         """

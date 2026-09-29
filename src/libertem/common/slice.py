@@ -1,10 +1,17 @@
 import math
-from typing import Any, Dict, Generator, Optional, Sequence, Tuple, overload
+from typing import Any, overload
+from collections.abc import Generator, Sequence
 
 import numpy as np
 
 from libertem.common.math import prod, count_nonzero
 from libertem.common.shape import Shape, ShapeLike
+
+
+class SliceUsageError(ValueError):
+    """
+    Raised when a Slice is incorrectly instantiated or used
+    """
 
 
 class Slice:
@@ -25,14 +32,14 @@ class Slice:
         self.origin = tuple(origin)
         self.shape = shape
         if len(self.origin) != len(self.shape):
-            raise ValueError(
+            raise SliceUsageError(
                 ("cannot build slice with dimensionality of shape/origin mismatch (%d vs %d); "
                  "origin=%r, shape=%r") % (
                      len(self.origin), len(self.shape), self.origin, self.shape,
                  )
             )
         if not isinstance(shape, Shape):
-            raise ValueError("please use libertem.common.Shape instance as shape parameter")
+            raise SliceUsageError("please use libertem.common.Shape instance as shape parameter")
 
     def __repr__(self) -> str:
         return f"<Slice origin={self.origin!r} shape={self.shape!r}>"
@@ -68,14 +75,14 @@ class Slice:
             the intersection between this and the other slice
         """
         if len(self.origin) != len(other.origin):
-            raise ValueError(
+            raise SliceUsageError(
                 ("cannot intersect slices with different dimensionality (%s vs %s); "
                  "self.origin=%r, other.origin=%r") % (
                     len(self.origin), len(other.origin), self.origin, other.origin,
                 )
             )
         if self.shape.sig.dims != other.shape.sig.dims:
-            raise ValueError(
+            raise SliceUsageError(
                 "cannot intersect slices with different signal dimensionality ({} vs {})".format(
                     self.shape.sig.dims, other.shape.sig.dims
                 )
@@ -114,12 +121,32 @@ class Slice:
         useful for translating to the local coordinate system of ``other``
         """
         if len(self.origin) != len(other.origin):
-            raise ValueError("cannot shift slices with different dimensionality ({} vs {})".format(
-                self.origin, other.origin
-            ))
+            raise SliceUsageError(
+                "cannot shift slices with different "
+                f"dimensionality ({self.origin} vs {other.origin})"
+            )
         return Slice(origin=tuple(our_coord - their_coord
                                   for (our_coord, their_coord) in zip(self.origin, other.origin)),
                      shape=self.shape)
+
+    def shift_by(self, offset: Sequence[int]) -> "Slice":
+        """
+        Return a new slice with the origin moved by the supplied offset
+        and the same shape
+        """
+        if len(self.origin) != len(offset):
+            raise SliceUsageError(
+                "cannot shift slices with different "
+                f"dimensionality ({self.origin} vs {offset})"
+            )
+        return Slice(
+            origin=tuple(
+                our_coord + off
+                for (our_coord, off)
+                in zip(self.origin, offset)
+            ),
+            shape=self.shape,
+        )
 
     @overload
     def get(
@@ -127,7 +154,7 @@ class Slice:
         arr: None = None,
         sig_only: bool = False,
         nav_only: bool = False
-    ) -> Tuple[slice, ...]: ...
+    ) -> tuple[slice, ...]: ...
 
     @overload
     def get(
@@ -139,7 +166,7 @@ class Slice:
 
     def get(
         self,
-        arr: Optional[np.ndarray] = None,
+        arr: np.ndarray | None = None,
         sig_only: bool = False,
         nav_only: bool = False
     ):
@@ -218,7 +245,7 @@ class Slice:
         new_shape = Shape(s, sig_dims=sig_dims)
         return Slice(origin=o, shape=new_shape)
 
-    def _discard_nav_key(self) -> Tuple[Tuple[int, ...], Tuple[int, ...], int]:
+    def _discard_nav_key(self) -> tuple[tuple[int, ...], tuple[int, ...], int]:
         """
         Construct a hashable tuple of the Slice with a zero-length nav dimensions
 
@@ -248,7 +275,7 @@ class Slice:
         # math.ceil(3/2) = math.ceil(1.5) = 2 -> we need two subslices across the y dimension
         shape = Shape(shape, sig_dims=self.shape.sig.dims)
         if self.shape.dims != shape.dims:
-            raise ValueError(
+            raise SliceUsageError(
                 ("cannot create subslices with different dimensionality (%d vs %d); "
                  "self.shape=%r, shape=%r") % (
                     self.shape.dims, shape.dims, self.shape, shape,
@@ -257,7 +284,7 @@ class Slice:
         ni = tuple(math.ceil(s1 / s)
                    for (s1, s) in zip(self.shape, shape))
 
-        def _make_slice(origin: Tuple[int, ...], new_shape: Shape) -> Slice:
+        def _make_slice(origin: tuple[int, ...], new_shape: Shape) -> Slice:
             sig_dims = new_shape.sig.dims
             # this makes sure that the border tiles have the correct shape set
             new_shape_tuple = tuple(
@@ -266,7 +293,7 @@ class Slice:
             )
             new_shape = Shape(new_shape_tuple, sig_dims=sig_dims)
             for x in new_shape_tuple:
-                assert x > 0,\
+                assert x > 0, \
                     "invalid shape: {!r} while subslicing {!r} with {!r} (origin={!r})".format(
                         new_shape, self.shape, shape, origin
                     )
@@ -346,7 +373,7 @@ class Slice:
             shape=Shape((nav_shape,) + tuple(self.shape.sig), sig_dims=sig_dims)
         )
 
-    def adjust_for_roi(self, roi: Optional[np.ndarray]) -> "Slice":
+    def adjust_for_roi(self, roi: np.ndarray | None) -> "Slice":
         """
         Make a new slice that has origin and shape modified according to `roi`.
         """
@@ -363,7 +390,7 @@ class Slice:
         shape = count_nonzero(roi[s_o:s_o + s_s])
         sig_dims = self.shape.sig.dims
         return Slice(
-            origin=(origin,) + self.origin[-sig_dims:],
+            origin=(origin,) + self.origin[self.shape.nav.dims:],
             shape=Shape((shape,) + tuple(self.shape.sig), sig_dims=sig_dims),
         )
 
@@ -371,12 +398,12 @@ class Slice:
         other_slice = Slice((0,) * shape.dims, shape)
         return self.intersection_with(other_slice)
 
-    def __getstate__(self) -> Dict[str, Any]:
+    def __getstate__(self) -> dict[str, Any]:
         return {
             k: getattr(self, k)
             for k in self.__slots__
         }
 
-    def __setstate__(self, state: Dict[str, Any]) -> None:
+    def __setstate__(self, state: dict[str, Any]) -> None:
         for k, v in state.items():
             setattr(self, k, v)

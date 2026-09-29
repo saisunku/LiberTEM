@@ -1,7 +1,9 @@
 from functools import partial
-from typing import Any, Iterable, List, Type, Optional
+from typing import Any
+from collections.abc import Iterable
 import contextlib
 from collections import defaultdict, OrderedDict
+import threading
 
 import numpy as np
 import dask
@@ -15,6 +17,7 @@ from libertem.utils.devices import detect
 from .base import BaseJobExecutor
 from libertem.common.executor import Environment, TaskCommHandler, TaskProtocol
 from libertem.common.scheduler import Worker, WorkerSet
+from libertem.common.backend import get_use_cuda
 
 from ..common.buffers import BufferWrapper
 from ..common.math import prod
@@ -28,13 +31,23 @@ from .utils import delayed_unpack
 
 
 class DelayedUDFRunner(UDFRunner):
-    def __init__(self, udfs: List[UDF], debug: bool = False, progress_reporter: Any = None):
-        self._part_results = defaultdict(lambda: {})
+    def __init__(self, udfs: list[UDF], debug: bool = False, progress_reporter: Any = None):
+        self._part_results = defaultdict(dict)
         super().__init__(udfs, debug=debug)
 
     @staticmethod
-    def _make_udf_result(udfs: Iterable[UDF], damage: BufferWrapper) -> "UDFResults":
-        udf_results = UDFRunner._make_udf_result(udfs, damage)
+    def _make_udf_result(
+        udfs: Iterable[UDF],
+        damage: BufferWrapper,
+        results_lock: threading.Lock,
+        make_copy: bool = False,
+    ) -> "UDFResults":
+        udf_results = UDFRunner._make_udf_result(
+            udfs,
+            damage,
+            results_lock,
+            make_copy,
+        )
         buffers = udf_results.buffers
         damage = udf_results.damage
         new_buffers = tuple(
@@ -49,7 +62,14 @@ class DelayedUDFRunner(UDFRunner):
             damage=damage,
         )
 
-    def _apply_part_result(self, udfs: Iterable[UDF], damage, part_results, task):
+    def _apply_part_result(
+        self,
+        udfs: Iterable[UDF],
+        damage,
+        part_results,
+        task,
+        results_lock: threading.Lock,
+    ):
         for part_results_udf, udf in zip(part_results, udfs):
             # Allow user to define an alternative merge strategy
             # using dask-compatible functions. In the Delayed case we
@@ -58,7 +78,7 @@ class DelayedUDFRunner(UDFRunner):
             # to udf.merge at once and in the correct order, so I am accumulating
             # results in self._part_results[udf] = {partition_slice_roi: part_results, ...}
             if (isinstance(udf, UDFMergeAllMixin)
-                    or type(udf).merge is UDF.merge and not udf.requires_custom_merge):
+                    or (type(udf).merge is UDF.merge and not udf.requires_custom_merge_all)):
                 if self._accumulate_part_results(udf, part_results_udf, task):
                     try:
                         parts = {
@@ -89,7 +109,12 @@ class DelayedUDFRunner(UDFRunner):
             src_dict = {k: b for k, b in src._dict.items()}
 
             dest_dict = {}
-            for k, b in udf.results.items():
+            for k, b_decl in udf.get_result_buffers().items():
+                # We skip result_only buffers since they are not expected
+                # in the dest_dict by the default merge function
+                if b_decl.use == 'result_only':
+                    continue
+                b = udf.results.get_buffer(k)
                 view = b.get_view_for_partition(task.partition)
                 # Handle result-only buffers
                 if view is not None:
@@ -106,7 +131,9 @@ class DelayedUDFRunner(UDFRunner):
             # call because this default Dask behaviour is to give a read-only
             # view of the arguments to the delayed function
             merged_del = delayed(merge_wrap, nout=len(flat_mapping))
-            merged_del_result = merged_del(udf, dest_dict, src_dict)
+            # need to copy the damage, as it will be overwritten in the next loop iteration,
+            # which is independent from actually evaluating the delayed object:
+            merged_del_result = merged_del(udf, dest_dict, src_dict, damage.raw_data.copy())
 
             # The following is needed when binding sequential updates on sig buffers
             # if bind_to is not None:
@@ -166,15 +193,18 @@ class DelayedUDFRunner(UDFRunner):
         return False
 
     def results_for_dataset_sync(self, dataset: DataSet, executor: 'DelayedJobExecutor',
-            roi: Optional[np.ndarray] = None, progress: bool = False,
-            corrections: Optional[CorrectionSet] = None, backends: Optional[BackendSpec] = None,
+            environment: Environment,
+            roi: np.ndarray | None = None, progress: bool = False,
+            corrections: CorrectionSet | None = None,
+            backends: BackendSpec | None = None,
             dry: bool = False) -> Iterable[tuple]:
 
         executor.register_master_udfs(self._udfs)
 
         return super().results_for_dataset_sync(
-            dataset, executor, roi=roi, progress=progress,
-            corrections=corrections, backends=backends, dry=dry
+            dataset, executor, environment=environment, roi=roi, progress=progress,
+            corrections=corrections, backends=backends,
+            dry=dry
         )
 
 
@@ -184,12 +214,19 @@ class DelayedJobExecutor(BaseJobExecutor):
 
     .. versionadded:: 0.9.0
 
+    Parameters
+    ----------
+
+    main_process_gpu : int or None, optional
+        GPU to use for the environment of process-local tasks
+
     Highly experimental at this time!
     """
-    def __init__(self):
+    def __init__(self, main_process_gpu: int | None = None):
         # Only import if actually instantiated, i.e. will likely be used
         import libertem.preload  # noqa: 401
         self._udfs = None
+        super().__init__(main_process_gpu=main_process_gpu)
 
     @contextlib.contextmanager
     def scatter(self, obj):
@@ -223,7 +260,8 @@ class DelayedJobExecutor(BaseJobExecutor):
 
         called from :meth:`DelayedUDFRunner.results_for_dataset_sync`
         """
-        env = Environment(threads_per_worker=1, threaded_executor=True)
+        gpu_id = get_use_cuda()
+        env = Environment(threads_per_worker=1, threaded_executor=True, gpu_id=gpu_id)
         for task in tasks:
             structure = structure_from_task(self._udfs, task)
             flat_structure = delayed_unpack.flatten_nested(structure)
@@ -341,7 +379,7 @@ class DelayedJobExecutor(BaseJobExecutor):
                                 for el in flat_mapping]
         return delayed_unpack.rebuild_nested(res_unpack, flat_mapping_reduced)
 
-    def get_udf_runner(self) -> Type['UDFRunner']:
+    def get_udf_runner(self) -> type['UDFRunner']:
         return DelayedUDFRunner
 
 
@@ -352,7 +390,7 @@ def make_copy(array_dict):
     return array_dict
 
 
-def merge_wrap(udf, dest_dict, src_dict):
+def merge_wrap(udf, dest_dict, src_dict, raw_damage):
     """
     The function called as delayed, acting as a wrapper
     to return a flat list of results rather than a structure
@@ -370,6 +408,7 @@ def merge_wrap(udf, dest_dict, src_dict):
     src = MergeAttrMapping(src_dict)
 
     # In place merge into the copy of dest
+    udf.meta.set_valid_nav_mask(raw_damage)
     udf.merge(dest=dest, src=src)
     # Return flat list of results so they can be unpacked later
     return delayed_unpack.flatten_nested(dest._dict)

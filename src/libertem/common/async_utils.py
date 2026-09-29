@@ -2,7 +2,9 @@ import sys
 import queue
 import asyncio
 import threading
-from typing import AsyncGenerator, Callable, Generator, Optional, TypeVar
+from typing import TypeVar
+from collections.abc import Callable
+from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import ThreadPoolExecutor
 
 from opentelemetry import trace
@@ -31,7 +33,7 @@ def _wrap_f(f, args, kwargs):
 
 
 async def sync_to_async(
-    fn: Callable[..., T], pool: Optional[ThreadPoolExecutor] = None, *args, **kwargs
+    fn: Callable[..., T], pool: ThreadPoolExecutor | None = None, *args, **kwargs
 ) -> T:
     """
     Run blocking function with `*args`, `**kwargs` in a thread pool.
@@ -59,7 +61,7 @@ async def sync_to_async(
 
 
 async def async_generator(
-    gen: Generator[T, None, None], pool: Optional[ThreadPoolExecutor] = None
+    gen: Generator[T, None, None], pool: ThreadPoolExecutor | None = None
 ) -> AsyncGenerator[T, None]:
     def inner_next(gen):
         try:
@@ -83,8 +85,10 @@ async def run_agen_get_last(gen: AsyncGenerator[T, None]) -> T:
             result = await gen.__anext__()
     except StopAsyncIteration:
         pass
+    finally:
+        await gen.aclose()
     if result is None:
-        raise RuntimeError("run_gen_get_last called with empty generator")
+        raise RuntimeError("run_agen_get_last called with empty generator")
     return result
 
 
@@ -95,6 +99,8 @@ def run_gen_get_last(gen: Generator[T, None, None]) -> T:
             result = gen.__next__()
     except StopIteration:
         pass
+    finally:
+        gen.close()
     if result is None:
         raise RuntimeError("run_gen_get_last called with empty generator")
     return result
@@ -272,7 +278,7 @@ def adjust_event_loop_policy():
     work for us by default, so call this as early as possible!
     """
     # stolen from ipykernel:
-    if sys.platform.startswith("win") and sys.version_info >= (3, 8):
+    if sys.platform.startswith("win"):
         try:
             from asyncio import (
                 WindowsProactorEventLoopPolicy,

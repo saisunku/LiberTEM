@@ -2,7 +2,7 @@ from io import SEEK_SET
 import math
 import os
 import re
-from typing import IO, TYPE_CHECKING, Dict, NamedTuple, List, Optional, Tuple
+from typing import IO, TYPE_CHECKING, NamedTuple
 import numpy as np
 from glob import glob, escape
 
@@ -126,32 +126,32 @@ class SeriesHeader(NamedTuple):
 def read_series_header(path: str) -> SeriesHeader:
     with open(path, 'rb') as f:
         arr = np.fromfile(f, dtype=series_header_dtype, count=1)
-    version = int(arr['IVersion'])
+    version = int(arr['IVersion'][0])
     if version not in [1, 2]:
         raise DataSetException(f"Unknown TVIPS header version: {version}")
-    size = int(arr['ISize'])
+    size = int(arr['ISize'][0])
     if size != SERIES_HEADER_SIZE:
         raise DataSetException(
             f"Invalid header size {size}, should be 256. Maybe not a TVIPS file?"
         )
-    bpp = int(arr['IBPP'])
+    bpp = int(arr['IBPP'][0])
     if bpp not in [8, 16]:
         raise DataSetException(
             f"unknown bpp value: {bpp} (should be either 8 or 16)"
         )
-    img_header_bytes = int(arr['IImgHeaderBytes'])
+    img_header_bytes = int(arr['IImgHeaderBytes'][0])
     if version == 1:
         img_header_bytes = 12
     return SeriesHeader(
-        version=int(arr['IVersion']),
-        xdim=int(arr['IXDim']),
-        ydim=int(arr['IYDim']),
-        xbin=int(arr['IXBin']),
-        ybin=int(arr['IYBin']),
+        version=int(arr['IVersion'][0]),
+        xdim=int(arr['IXDim'][0]),
+        ydim=int(arr['IYDim'][0]),
+        xbin=int(arr['IXBin'][0]),
+        ybin=int(arr['IYBin'][0]),
         bpp=bpp,
-        pixel_size_nm=int(arr['IPixelSize']),
-        high_tension_kv=int(arr['IHT']),
-        mag_total=int(arr['IMagTotal']),
+        pixel_size_nm=int(arr['IPixelSize'][0]),
+        high_tension_kv=int(arr['IHT'][0]),
+        mag_total=int(arr['IMagTotal'][0]),
         frame_header_bytes=img_header_bytes,
     )
 
@@ -182,7 +182,7 @@ def _pattern(path: str) -> str:
     return pattern
 
 
-def get_image_count_and_sig_shape(path: str) -> Tuple[int, Tuple[int, int]]:
+def get_image_count_and_sig_shape(path: str) -> tuple[int, tuple[int, int]]:
     fns = get_filenames(path)
     count = 0
     series_header = read_series_header(fns[0])
@@ -203,11 +203,11 @@ def _image_header_for_idx(f: IO[bytes], series_header: SeriesHeader, idx: int) -
     return np.fromfile(f, dtype=image_header_v2_dtype, count=1)  # type:ignore
 
 
-def _scan_for_idx(f: IO[bytes], series_header: SeriesHeader, idx: int) -> Tuple[int, int]:
+def _scan_for_idx(f: IO[bytes], series_header: SeriesHeader, idx: int) -> tuple[int, int]:
     arr = _image_header_for_idx(f, series_header, idx)
     # this assumes integer scan coordinates:
-    scan_y = int(arr['Scan_y'])
-    scan_x = int(arr['Scan_x'])
+    scan_y = int(arr['Scan_y'][0])
+    scan_x = int(arr['Scan_x'][0])
     scan = (scan_y, scan_x)
     return scan
 
@@ -216,7 +216,7 @@ class DetectionError(Exception):
     pass
 
 
-def detect_shape(path: str) -> Tuple[int, Tuple[int, ...]]:
+def detect_shape(path: str) -> tuple[int, tuple[int, ...]]:
     series_header = read_series_header(path)
 
     if series_header.version != 2:
@@ -258,7 +258,7 @@ def detect_shape(path: str) -> Tuple[int, Tuple[int, ...]]:
                 break
             idx += 1
 
-    shape: Tuple[int, ...]
+    shape: tuple[int, ...]
     if found_shape:
         shape = (int(math.floor((count - sync_offset) / (max_x + 1))), max_x + 1)
     else:
@@ -274,7 +274,7 @@ def _get_suffix(path: str) -> int:
     return int(path[-3:])
 
 
-def get_filenames(path: str) -> List[str]:
+def get_filenames(path: str) -> list[str]:
     return list(sorted(glob(_pattern(path)), key=_get_suffix))
 
 
@@ -316,24 +316,34 @@ class TVIPSDataSet(DataSet):
         If negative, number of blank frames to insert at start
         If not given, we try to automatically determine the sync_offset from
         the scan metadata in the image headers.
+
+    num_partitions: int, optional
+        Override the number of partitions. This is useful if the
+        default number of partitions, chosen based on common workloads,
+        creates partitions which are too large (or small) for the UDFs
+        being run on this dataset.
     """
     def __init__(
         self,
         path,
-        nav_shape: Optional[Tuple[int, ...]] = None,
-        sig_shape: Optional[Tuple[int, ...]] = None,
-        sync_offset: Optional[int] = None,
-        io_backend: Optional[IOBackend] = None,
+        nav_shape: tuple[int, ...] | None = None,
+        sig_shape: tuple[int, ...] | None = None,
+        sync_offset: int | None = None,
+        io_backend: IOBackend | None = None,
+        num_partitions: int | None = None,
     ):
-        super().__init__(io_backend=io_backend)
+        super().__init__(
+            io_backend=io_backend,
+            num_partitions=num_partitions,
+        )
         self._nav_shape = tuple(nav_shape) if nav_shape else nav_shape
         self._sig_shape = tuple(sig_shape) if sig_shape else sig_shape
         self._sync_offset = sync_offset
         self._path = path
         self._filesize = None
-        self._files: Optional[List[str]] = None
-        self._frame_counts: Dict[str, int] = {}
-        self._series_header: Optional[SeriesHeader] = None
+        self._files: list[str] | None = None
+        self._frame_counts: dict[str, int] = {}
+        self._series_header: SeriesHeader | None = None
 
     def initialize(self, executor: JobExecutor):
         self._filesize = executor.run_function(self._get_filesize)
@@ -376,7 +386,7 @@ class TVIPSDataSet(DataSet):
         elif self._series_header.bpp == 16:
             raw_dtype = np.uint16
 
-        nav_shape: Tuple[int, ...]
+        nav_shape: tuple[int, ...]
         if self._nav_shape is None and nav_shape_detected is not None:
             nav_shape = nav_shape_detected
         elif self._nav_shape is None and nav_shape_detected is None:
@@ -390,7 +400,7 @@ class TVIPSDataSet(DataSet):
         self._nav_shape_product = prod(nav_shape)
         image_size = (self._series_header.ydim, self._series_header.xdim)
 
-        sig_shape: Tuple[int, ...]
+        sig_shape: tuple[int, ...]
         if self._sig_shape is None:
             sig_shape = image_size
         elif prod(self._sig_shape) != prod(image_size):

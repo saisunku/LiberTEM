@@ -1,4 +1,4 @@
-// eslint-disable-next-line @typescript-eslint/ban-types
+// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
 type ImmutablePrimitive = undefined | null | boolean | string | number | Function;
 
 export type Immutable<T> =
@@ -15,9 +15,8 @@ export type ImmutableObject<T> = { readonly [K in keyof T]: Immutable<T[K]> };
 
 type DeepReadonly<T> =
     T extends Array<infer R> ? DeepReadonlyArray<R> :
-    // eslint-disable-next-line @typescript-eslint/ban-types
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
     T extends Function ? T :
-    // eslint-disable-next-line @typescript-eslint/ban-types
     T extends object ? DeepReadonlyObject<T> :
     T;
 
@@ -47,6 +46,35 @@ export const updateById = <R>(state: ById<R>, id: string, partialRecord: Partial
 export const insertById = <R>(state: ById<R>, id: string, record: R): ById<R> => {
     const newById = Object.assign({}, state.byId, { [id]: record });
     const newIds = [...state.ids, id];
+    return { byId: newById, ids: newIds };
+}
+
+export const insertOrReplace = <R>(state: ById<R>, id: string, record: R): ById<R> => {
+    const newById = Object.assign({}, state.byId, { [id]: record });
+    // keep the order stable, and insert the new id only if needed
+    let newIds;
+    if(state.ids.includes(id)) {
+        newIds = [...state.ids];
+    } else {
+        newIds = [...state.ids, id];
+    }
+    return Object.assign({}, state, { byId: newById, ids: newIds });
+}
+
+export const updateIfExists = <R>(state: ById<R>, id: string, record: R): ById<R> => {
+    const newById = Object.assign({}, state.byId, { [id]: record });
+    if(state.ids.includes(id)) {
+        const newIds = [...state.ids, id];
+        return Object.assign({}, state, { byId: newById, ids: newIds });
+    } else {
+        // don't do enything if the id is not found
+        return state;
+    }
+}
+
+export const removeById = <R>(state: ById<R>, id: string): ById<R> => {
+    const {[id]: _, ...newById} = state.byId;
+    const newIds = state.ids.filter(thisId => thisId !== id);
     return { byId: newById, ids: newIds };
 }
 

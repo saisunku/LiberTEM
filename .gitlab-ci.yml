@@ -1,0 +1,124 @@
+variables:
+  CUSTOM_CI_BUILDS_DIR: /p/scratch/slen/clausen1
+
+stages:
+  - prepare
+  - benchmark
+  - cleanup
+
+jusuf_login:
+  id_tokens:
+    SITE_ID_TOKEN:
+      aud: "https://gitlab.jsc.fz-juelich.de"
+  stage: prepare
+  tags:
+    - jusuf
+    - jacamar
+    - login
+    - shell
+  script:
+    - module load Python/3.13.5
+    - module load git
+    - export MY_JOB_PREFIX=/p/scratch/slen/clausen1/cb-libertem-$CI_PIPELINE_ID
+    - mkdir -p $MY_JOB_PREFIX/
+    - (cd $MY_JOB_PREFIX/ && wget https://raw.githubusercontent.com/LiberTEM/benchmarks/refs/heads/main/utils/subsample.py)
+
+    # main run:
+    - export TOX_WORK_DIR=$MY_JOB_PREFIX/tox-main
+    - python3 -m venv $MY_JOB_PREFIX/venv-main
+    - $MY_JOB_PREFIX/venv-main/bin/pip install tox-uv uv click numpy
+    - $MY_JOB_PREFIX/venv-main/bin/tox run -e benchmark-cb -- --help  # only create
+
+    # reference run:
+    - export TOX_WORK_DIR=$MY_JOB_PREFIX/tox-ref
+    - git clone https://github.com/LiberTEM/LiberTEM.git $MY_JOB_PREFIX/git-ref --depth=10
+    - cd $MY_JOB_PREFIX/git-ref
+    - git log -n 10 --oneline
+    - git rev-parse HEAD
+    - python3 -m venv $MY_JOB_PREFIX/venv-ref
+    - $MY_JOB_PREFIX/venv-ref/bin/pip install tox-uv uv click numpy
+    - $MY_JOB_PREFIX/venv-ref/bin/tox run -e benchmark-cb -- --help  # only create
+
+# TODO: update job names (to something generic) - for now kept like this for the comparison script
+# TODO: reduce repetition in job scripts
+
+cpu:
+  id_tokens:
+    SITE_ID_TOKEN:
+      aud: "https://gitlab.jsc.fz-juelich.de"
+  variables:
+    SCHEDULER_PARAMETERS: '--account=slen -N1 --cpus-per-task 128 --partition=batch --disable-turbomode --cpufreq=2000'
+  stage: benchmark
+  tags:
+    - jusuf
+    - jacamar
+    - compute
+    - slurm
+  script:
+    - module load Python/3.13.5
+    - module load git
+    - export MY_JOB_PREFIX=/p/scratch/slen/clausen1/cb-libertem-$CI_PIPELINE_ID
+    - export MY_VENV=$MY_JOB_PREFIX/venv-main
+    - export TOX_WORK_DIR=$MY_JOB_PREFIX/tox-main
+    - export PYTEST_DEBUG_TEMPROOT=$LOCALSCRATCH
+    - pwd
+    - ls -la
+    - $MY_VENV/bin/tox run -e benchmark-cb --skip-pkg-install
+    - cp bench-results.json bench-results-orig.json
+    - $MY_VENV/bin/python $MY_JOB_PREFIX/subsample.py 1000 < bench-results-orig.json > bench-results.json
+  artifacts:
+    paths:
+      - bench-results.json
+      - bench-results-orig.json
+
+
+cpu_reference_run:
+  id_tokens:
+    SITE_ID_TOKEN:
+      aud: "https://gitlab.jsc.fz-juelich.de"
+  variables:
+    SCHEDULER_PARAMETERS: '--account=slen -N1 --cpus-per-task 128 --partition=batch --disable-turbomode --cpufreq=2000'
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^PullRequest_/
+  stage: benchmark
+  tags:
+    - jusuf
+    - jacamar
+    - compute
+    - slurm
+  script:
+    - module load Python/3.13.5
+    - module load git
+    - export MY_JOB_PREFIX=/p/scratch/slen/clausen1/cb-libertem-$CI_PIPELINE_ID
+    - export MY_VENV=$MY_JOB_PREFIX/venv-ref
+    - export TOX_WORK_DIR=$MY_JOB_PREFIX/tox-ref
+    - export PYTEST_DEBUG_TEMPROOT=$LOCALSCRATCH
+    - cd $MY_JOB_PREFIX/git-ref
+    - pwd
+    - ls -la
+    - $MY_VENV/bin/tox run -e benchmark-cb --skip-pkg-install
+    - cp bench-results.json bench-results-orig.json
+    - $MY_VENV/bin/python $MY_JOB_PREFIX/subsample.py 1000 < bench-results-orig.json > bench-results.json
+    - cp bench-results.json $CI_PROJECT_DIR/
+    - cp bench-results-orig.json $CI_PROJECT_DIR/
+  artifacts:
+    paths:
+      - bench-results.json
+      - bench-results-orig.json
+
+cleanup-cb-directory:
+  id_tokens:
+    SITE_ID_TOKEN:
+      aud: "https://gitlab.jsc.fz-juelich.de"
+  stage: cleanup
+  tags:
+    - jusuf
+    - jacamar
+    - login
+    - shell
+  script:
+    - export MY_JOB_PREFIX=/p/scratch/slen/clausen1/cb-libertem-$CI_PIPELINE_ID
+    - rm -rf $MY_JOB_PREFIX/
+  when: always
+
+# vim:ts=2:sw=2

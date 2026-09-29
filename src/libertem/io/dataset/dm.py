@@ -63,7 +63,7 @@ class SingleDMDatasetParams(MessageConverter):
 
 
 class StackedDMDatasetParams(MessageConverter):
-    SCHEMA: typing.Dict = {}
+    SCHEMA: dict = {}
 
     def convert_from_python(self, raw_data):
         return super().convert_from_python(raw_data)
@@ -184,13 +184,13 @@ class StackedDMDataSet(DMDataSet):
         List of paths to the files that should be loaded. The order is important,
         as it determines the order in the navigation axis.
 
-    nav_shape : Tuple[int] or None
+    nav_shape : Tuple[int, ...] or None
         By default, the files are loaded as a 3D stack. You can change this
         by specifying the nav_shape, which reshapes the navigation dimensions.
         Raises a `DataSetException` if the shape is incompatible with the data
         that is loaded.
 
-    sig_shape: Tuple[int], optional
+    sig_shape: Tuple[int, ...], optional
         Signal/detector size (height, width)
 
     sync_offset: int, optional
@@ -204,10 +204,16 @@ class StackedDMDataSet(DMDataSet):
         absolutely know that the offsets and sizes are the same for all files,
         you can set this parameter and we will skip reading all metadata but
         the one from the first file.
+
+    num_partitions: int, optional
+        Override the number of partitions. This is useful if the
+        default number of partitions, chosen based on common workloads,
+        creates partitions which are too large (or small) for the UDFs
+        being run on this dataset.
     """
     def __init__(self, files=None, scan_size=None, same_offset=False, nav_shape=None,
-                 sig_shape=None, sync_offset=0, io_backend=None):
-        super().__init__(io_backend=io_backend)
+                 sig_shape=None, sync_offset=0, io_backend=None, num_partitions=None):
+        super().__init__(io_backend=io_backend, num_partitions=num_partitions)
         self._meta = None
         self._same_offset = same_offset
         self._nav_shape = tuple(nav_shape) if nav_shape else nav_shape
@@ -225,14 +231,29 @@ class StackedDMDataSet(DMDataSet):
         self._filesize = None
         self._files = files
         if not isinstance(files, (list, tuple)):
-            raise DataSetException("files argument must be an iterable\
-                                    of file paths, recieved {type(files)}")
+            raise DataSetException(f"files argument must be an iterable of file paths, "
+                                   f"received {type(files)}")
         if len(files) == 0:
             raise DataSetException("need at least one file as input!")
         self._fileset = None
         # per-file cached attributes:
         self._z_sizes = {}
         self._offsets = {}
+
+    def __new__(cls, *args, **kwargs):
+        '''
+        Skip the superclasse's :code:`__new__()` method.
+
+        Instead, go straight to the grandparent. That disables the
+        :class:`DMDataSet` type determination magic. Otherwise unpickling will
+        always yield a :class:`SingleDMDataSet` since this class inherits the
+        parent's :code:`__new__()` method and unpickling calls it without
+        parameters, making it select :class:`SingleDMDataSet`.
+
+        It mimics calling the superclass :code:`__new__(cls)` without additional
+        parameters, just like the parent's method.
+        '''
+        return DataSet.__new__(cls)
 
     def _get_sig_shape_and_native_dtype(self):
         first_fn = self._get_files()[0]
@@ -299,7 +320,7 @@ class StackedDMDataSet(DMDataSet):
                 fn: metadata[fn]['zsize']
                 for fn in self._get_files()
             }
-        self._image_count = sum(self._z_sizes.values())
+        self._image_count = int(sum(self._z_sizes.values()))
         if self._nav_shape is None:
             self._nav_shape = (sum(self._z_sizes.values()),)
         native_sig_shape, native_dtype = executor.run_function(self._get_sig_shape_and_native_dtype)
@@ -326,7 +347,7 @@ class StackedDMDataSet(DMDataSet):
         return {"dm3", "dm4"}
 
     @classmethod
-    def get_msg_converter(cls) -> typing.Type[MessageConverter]:
+    def get_msg_converter(cls) -> type[MessageConverter]:
         return StackedDMDatasetParams
 
     @classmethod

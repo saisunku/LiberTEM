@@ -14,7 +14,7 @@ class FSError(Exception):
         self.alternative = alternative
 
 
-def _access_ok(path):
+def _access_ok(path: Path):
     try:
         # May trigger PermissionError on Windows
         allowed = os.path.isdir(path) and os.access(path, os.R_OK | os.X_OK)
@@ -27,8 +27,8 @@ def _access_ok(path):
         return False
 
 
-def _get_alt_path(path):
-    cur_path = Path(path)
+def _get_alt_path(path: str):
+    cur_path = Path(path).expanduser()
     try:
         cur_path = cur_path.resolve()
     # Triggered by empty DVD drive or permission denied on Windows
@@ -49,9 +49,26 @@ def _get_alt_path(path):
     return cur_path
 
 
-def get_fs_listing(path):
+def stat_path(path: str):
     try:
-        Path(path).resolve()
+        return Path(path).expanduser().resolve().stat()
+    except FileNotFoundError:
+        raise FSError(
+            code="NOT_FOUND",
+            msg="path %s could not be found" % path,
+            alternative=str(_get_alt_path(path)),
+        )
+    except PermissionError as e:
+        raise FSError(
+            code="PERMISSION_ERROR",
+            msg=str(e),
+            alternative=str(_get_alt_path(path)),
+        )
+
+
+def get_fs_listing(path: str):
+    try:
+        abspath = Path(path).expanduser().resolve()
     # Triggered by empty DVD drive on Windows
     except PermissionError as e:
         raise FSError(
@@ -59,28 +76,27 @@ def get_fs_listing(path):
             msg=str(e),
             alternative=str(_get_alt_path(path)),
         )
-    if not os.path.isdir(path):
+    if not abspath.is_dir():
         raise FSError(
             code="NOT_FOUND",
             msg="path %s could not be found" % path,
             alternative=str(_get_alt_path(path)),
         )
-    if not _access_ok(path):
+    if not _access_ok(abspath):
         raise FSError(
             code="ACCESS_DENIED",
             msg="access to %s was denied" % path,
             alternative=str(_get_alt_path(path)),
         )
-    path = os.path.abspath(path)
-    names = os.listdir(path)
+    names = os.listdir(abspath)
     dirs = []
     files = []
     names = [".."] + names
     for name in names:
-        full_path = os.path.join(path, name)
+        full_path = os.path.join(abspath, name)
         try:
             s = os.stat(full_path)
-        except FileNotFoundError:
+        except (FileNotFoundError, PermissionError):
             # this can happen either because of a TOCTOU-like race condition
             # or for example for things like broken softlinks
             continue
@@ -107,7 +123,7 @@ def get_fs_listing(path):
     ]
 
     return {
-        "path": path,
+        "path": str(abspath),
         "files": files,
         "dirs": dirs,
         "drives": drives,

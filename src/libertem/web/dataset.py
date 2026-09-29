@@ -1,7 +1,6 @@
 import time
 import logging
 import functools
-from typing import Dict
 
 import tornado.web
 from opentelemetry import trace
@@ -73,13 +72,13 @@ class DataSetDetailHandler(CORSMixin, tornado.web.RequestHandler):
             self.set_status(404, "dataset with uuid %s not found" % uuid)
             return
         await self.dataset_state.remove(uuid)
-        msg = Message(self.state).delete_dataset(uuid)
+        msg = Message().delete_dataset(uuid)
         log_message(msg)
         self.event_registry.broadcast_event(msg)
         self.write(msg)
 
     async def prime_numba_caches(self, ds):
-        executor = self.state.executor_state.get_executor()
+        executor = await self.state.executor_state.get_executor()
 
         log.info("starting warmup")
 
@@ -100,7 +99,7 @@ class DataSetDetailHandler(CORSMixin, tornado.web.RequestHandler):
         log.info("warmup done, took %.3fs", (t1 - t0))
 
     async def put(self, uuid):
-        request_data: Dict = tornado.escape.json_decode(self.request.body)
+        request_data: dict = tornado.escape.json_decode(self.request.body)
         params = request_data['dataset']['params']
         params["type"] = ds_type = params["type"].upper()
         cls = get_dataset_cls(ds_type)
@@ -108,9 +107,11 @@ class DataSetDetailHandler(CORSMixin, tornado.web.RequestHandler):
         converter = ConverterCls()
         try:
             dataset_params = converter.to_python(params)
-            executor = self.state.executor_state.get_executor()
+            executor = await self.state.executor_state.get_executor()
 
-            ds = await load(filetype=cls, executor=executor, enable_async=True, **dataset_params)
+            ds = await load(
+                filetype=cls, executor=executor, enable_async=True, **dataset_params
+            )
 
             with tracer.start_as_current_span("prime_numba_caches"):
                 await self.prime_numba_caches(ds)
@@ -122,14 +123,14 @@ class DataSetDetailHandler(CORSMixin, tornado.web.RequestHandler):
                 converted=dataset_params,
             )
             details = await self.dataset_state.serialize(dataset_id=uuid)
-            msg = Message(self.state).create_dataset(dataset=uuid, details=details)
+            msg = Message().create_dataset(dataset=uuid, details=details)
             log_message(msg)
             self.write(msg)
             self.event_registry.broadcast_event(msg)
         except Exception as e:
             if uuid in self.dataset_state:
                 await self.dataset_state.remove(uuid)
-            msg = Message(self.state).create_dataset_error(uuid, str(e))
+            msg = Message().create_dataset_error(uuid, str(e))
             log_message(msg, exception=True)
             self.write(msg)
             return
@@ -142,14 +143,14 @@ class DataSetDetectHandler(tornado.web.RequestHandler):
 
     async def get(self):
         path = self.request.arguments['path'][0].decode("utf8")
-        executor = self.state.executor_state.get_executor()
+        executor = await self.state.executor_state.get_executor()
 
         detected_params = await sync_to_async(
             detect, path=path, executor=executor.ensure_sync()
         )
 
         if not detected_params:
-            msg = Message(self.state).dataset_detect_failed(path=path)
+            msg = Message().dataset_detect_failed(path=path)
             log_message(msg)
             self.write(msg)
             return
@@ -159,6 +160,6 @@ class DataSetDetectHandler(tornado.web.RequestHandler):
             info = detected_params["info"]
         params.update({"type": detected_params["type"].upper()})
         info.update({"type": detected_params["type"].upper()})
-        msg = Message(self.state).dataset_detect(params=params, info=info)
+        msg = Message().dataset_detect(params=params, info=info)
         log_message(msg)
         self.write(msg)

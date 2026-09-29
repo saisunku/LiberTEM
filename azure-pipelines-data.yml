@@ -15,6 +15,7 @@ variables:
   - name: PIP_CACHE_DIR
     value: $(Pipeline.Workspace)/.pip
   - group: Packaging
+  - group: Coverage
   - name: npm_config_cache
     value: $(Pipeline.Workspace)/.npm
   - name: tox_dir
@@ -48,9 +49,9 @@ stages:
         displayName: 'list available data'
 
       - task: UsePythonVersion@0
-        displayName: 'Use Python 3.9'
+        displayName: 'Use Python 3.11'
         inputs:
-          versionSpec: '3.9'
+          versionSpec: '3.11'
 
 #      - task: Cache@2
 #        inputs:
@@ -61,10 +62,10 @@ stages:
 #          path: $(PIP_CACHE_DIR)
 #        displayName: 'cache pip packages'
 
-      - bash: python3.9 -m venv venv
+      - bash: python3.11 -m venv venv
         displayName: 'create venv'
 
-      - bash: ./venv/bin/pip install tox
+      - bash: ./venv/bin/pip install tox 'tox-uv!=1.33'
         displayName: 'install tox'
 
       - ${{ if eq(parameters.recreate_tox, true) }}:
@@ -77,6 +78,9 @@ stages:
 
       - bash: ./scripts/codecov.sh -f ./coverage.xml
         displayName: 'Submit coverage to codecov.io'
+        ${{ if and(not(eq(variables['Build.Reason'], 'PullRequest')), eq(variables['Build.SourceBranch'], 'refs/heads/master')) }}:
+          env:
+            CODECOV_TOKEN: $(CODECOV_TOKEN)
 
       - task: PublishTestResults@2
         condition: succeededOrFailed()
@@ -88,21 +92,21 @@ stages:
       pool: DataAccess
       strategy:
         matrix:
-          # 3.7: oldest version
-          Python37:
-            python.version: '3.7'
-            TOXENV: 'py37-data'
-          ${{ if eq(parameters.run_slow, true) }}:
-            Python38:
-              python.version: '3.8'
-              TOXENV: 'py38-data'
-          # 3.9: default in current Debian stable
-          Python39:
-            python.version: '3.9'
-            TOXENV: 'py39-data'
           Python310:
             python.version: '3.10'
             TOXENV: 'py310-data'
+          Python311:
+            python.version: '3.11'
+            TOXENV: 'py311-data'
+          Python312:
+            python.version: '3.12'
+            TOXENV: 'py312-data'
+          Python313:
+            python.version: '3.13'
+            TOXENV: 'py313-data'
+          Python314:
+            python.version: '3.14'
+            TOXENV: 'py314-data'
       variables:
         TESTDATA_BASE_PATH: '/data/'
       steps:
@@ -114,20 +118,11 @@ stages:
         inputs:
           versionSpec: '$(python.version)'
 
-#      - task: Cache@2
-#        inputs:
-#          key: 'python | "$(Agent.OS)" | test_requirements.txt'
-#          restoreKeys: |
-#            python | "$(Agent.OS)"
-#            python
-#          path: $(PIP_CACHE_DIR)
-#        displayName: 'cache pip packages'
-
-      - bash: python3.9 -m venv venv
+      - bash: python3 -m venv venv
         displayName: 'create venv'
 
-      - bash: ./venv/bin/pip install tox
-        displayName: 'install tox'
+      - bash: ./venv/bin/pip install tox 'tox-uv!=1.33'
+        displayName: 'install tox (w/ uv)'
 
       - ${{ if eq(parameters.recreate_tox, true) }}:
         - bash: ./venv/bin/tox -r
@@ -143,65 +138,9 @@ stages:
 
       - bash: ./scripts/codecov.sh -f ./coverage.xml
         displayName: 'Submit coverage to codecov.io'
-
-      - task: PublishTestResults@2
-        condition: succeededOrFailed()
-        inputs:
-          testResultsFiles: 'junit.xml'
-          testRunTitle: 'Publish test results for Python $(python.version)'
-
-    - job: linux_tests
-      pool: DataAccess
-      strategy:
-        matrix:
-          Python37:
-            python.version: '3.7'
-            TOXENV: 'py37'
-          ${{ if eq(parameters.run_slow, true) }}:
-            Python38:
-              python.version: '3.8'
-              TOXENV: 'py38'
-          Python39:
-            python.version: '3.9'
-            TOXENV: 'py39'
-          Python310:
-            python.version: '3.10'
-            TOXENV: 'py310'
-      variables:
-        TOXENV: '$(TOXENV)'
-      steps:
-      - task: UsePythonVersion@0
-        displayName: 'Use Python $(python.version)'
-        inputs:
-          versionSpec: '$(python.version)'
-
-#      - task: Cache@2
-#        inputs:
-#          key: 'python | "$(Agent.OS)" | "$(python.version)" | setup.py | test_requirements.txt'
-#          restoreKeys: |
-#            python | "$(Agent.OS)" | "$(python.version)"
-#            python | "$(Agent.OS)"
-#            python
-#          path: $(PIP_CACHE_DIR)
-#        displayName: 'cache pip packages'
-
-      - bash: pip install -U tox
-        displayName: 'install requirements'
-
-      - ${{ if eq(parameters.recreate_tox, true) }}:
-        - bash: tox -r
-          displayName: 'Run tox tests $(TOXENV) $(Agent.OS) (recreating)'
-
-      - ${{ if eq(parameters.recreate_tox, false) }}:
-        - bash: tox
-          displayName: 'Run tox tests $(TOXENV) $(Agent.OS)'
-
-      - ${{ if eq(parameters.run_slow, true) }}:
-        - bash: tox -- -m "slow and not dist" --cov-append tests/
-          displayName: 'Run tox slow tests $(TOXENV) $(Agent.OS)'
-
-      - bash: ./scripts/codecov.sh -f ./coverage.xml
-        displayName: 'Submit coverage to codecov.io'
+        ${{ if and(not(eq(variables['Build.Reason'], 'PullRequest')), eq(variables['Build.SourceBranch'], 'refs/heads/master')) }}:
+          env:
+            CODECOV_TOKEN: $(CODECOV_TOKEN)
 
       - task: PublishTestResults@2
         condition: succeededOrFailed()
@@ -215,27 +154,11 @@ stages:
         TOXENV: 'numba_coverage'
       steps:
       - task: UsePythonVersion@0
-        displayName: 'Use Python 3.9'
+        displayName: 'Use Python 3.11'
         inputs:
-          versionSpec: '3.9'
+          versionSpec: '3.11'
 
-#      - task: Cache@2
-#        inputs:
-#          key: 'python | "$(Agent.OS)" | "3.9" | setup.py | test_requirements.txt'
-#          restoreKeys: |
-#            python | "$(Agent.OS)" | "3.9"
-#            python | "$(Agent.OS)"
-#            python
-#          path: $(PIP_CACHE_DIR)
-#        displayName: 'cache pip packages'
-
-#      - task: Cache@2
-#        inputs:
-#          key: 'tox_numba_coverage | "$(Agent.OS)" | test_requirements.txt | setup.py'
-#          path: $(tox_dir)
-#        displayName: 'cache tox environment'
-
-      - bash: pip install -U tox
+      - bash: pip install -U tox 'tox-uv!=1.33'
         displayName: 'install requirements'
 
       - ${{ if eq(parameters.recreate_tox, true) }}:
@@ -248,12 +171,15 @@ stages:
 
       - bash: ./scripts/codecov.sh -f ./coverage.xml
         displayName: 'Submit coverage to codecov.io'
+        ${{ if and(not(eq(variables['Build.Reason'], 'PullRequest')), eq(variables['Build.SourceBranch'], 'refs/heads/master')) }}:
+          env:
+            CODECOV_TOKEN: $(CODECOV_TOKEN)
 
       - task: PublishTestResults@2
         condition: succeededOrFailed()
         inputs:
           testResultsFiles: 'junit.xml'
-          testRunTitle: 'Publish test results for numba coverage on Python 3.9'
+          testRunTitle: 'Publish test results for numba coverage on Python 3.11'
 
     - job: lint
       pool: DataAccess
@@ -265,29 +191,13 @@ stages:
         TOXENV: '$(TOXENV)'
       steps:
       - task: UsePythonVersion@0
-        displayName: 'Use Python 3.9'
+        displayName: 'Use Python 3.12'
         inputs:
-          versionSpec: '3.9'
+          versionSpec: '3.12'
       - bash: apt-get update && apt-get install -y pandoc graphviz
         displayName: install required debian packages
 
-#      - task: Cache@2
-#        inputs:
-#          key: 'lint | "$(Agent.OS)"'
-#          restoreKeys: |
-#            lint | "$(Agent.OS)"
-#            lint
-#          path: $(PIP_CACHE_DIR)
-#        displayName: 'cache pip packages'
-#
-#      - task: Cache@2
-#        inputs:
-#          key: 'tox_lint | "$(Agent.OS)" | docs_requirements.txt | test_requirements.txt | setup.py | "$(TOXENV)"'
-#          path: $(tox_dir)
-#        displayName: 'cache tox environment'
-
-
-      - bash: pip install -U tox
+      - bash: pip install -U tox 'tox-uv!=1.33'
         displayName: 'install requirements'
 
       - ${{ if eq(parameters.recreate_tox, true) }}:
@@ -304,9 +214,9 @@ stages:
         TESTDATA_BASE_PATH: '/data/'
       steps:
       - task: UsePythonVersion@0
-        displayName: 'Use Python 3.9'
+        displayName: 'Use Python 3.11'
         inputs:
-          versionSpec: '3.9'
+          versionSpec: '3.11'
 
       - checkout: self
       - checkout: LiberTEM-live
@@ -314,131 +224,17 @@ stages:
       - bash: python3 -m venv $(Agent.TempDirectory)/venv/
         displayName: create virtualenv
 
-      - bash: $(Agent.TempDirectory)/venv/bin/pip install $(Build.SourcesDirectory)/LiberTEM/
+      - bash: $(Agent.TempDirectory)/venv/bin/pip install uv
+        displayName: install uv
+
+      - bash: $(Agent.TempDirectory)/venv/bin/uv pip install $(Build.SourcesDirectory)/LiberTEM/
         displayName: install LiberTEM
 
       - bash: $(Agent.TempDirectory)/venv/bin/pip install "$(Build.SourcesDirectory)/LiberTEM-live/[dectris]"
         displayName: install LiberTEM-live
 
-      - bash: $(Agent.TempDirectory)/venv/bin/pip install -r $(Build.SourcesDirectory)/LiberTEM-live/test_requirements.txt
+      - bash: . $(Agent.TempDirectory)/venv/bin/activate &&  $(Agent.TempDirectory)/venv/bin/uv pip install -r $(Build.SourcesDirectory)/LiberTEM-live/test_requirements.txt
         displayName: install LiberTEM-live test requirements
 
       - bash: cd $(Build.SourcesDirectory)/LiberTEM-live/ && $(Agent.TempDirectory)/venv/bin/pytest
         displayName: run LiberTEM-live tests
-
-    - job: node_tests
-      pool: DataAccess
-      steps:
-      - task: NodeTool@0
-        inputs:
-          versionSpec: '16'
-
-#      - task: Cache@2
-#        inputs:
-#          key: 'npm | "$(Agent.OS)" | client/package-lock.json'
-#          restoreKeys: |
-#            npm | "$(Agent.OS)"
-#          path: $(npm_config_cache)
-#        displayName: Cache npm
-
-      - bash: (cd client && npm ci)
-        displayName: 'install npm dependencies'
-
-      - bash: (cd client && npm run build)
-        displayName: 'ensure the typescript build works'
-
-      - bash: (cd client && CI=1 npm test -- --coverage --all)
-        displayName: 'run client tests'
-
-      - bash: (cd client && npm run lint)
-        displayName: 'run client linter'
-
-      - bash: ./scripts/codecov.sh -f client/coverage/coverage-final.json
-        displayName: 'Submit coverage to codecov.io'
-
-  - stage: deploy
-    jobs:
-    - job: deploy_docs
-      pool: DataAccess
-      steps:
-      - task: UsePythonVersion@0
-        displayName: 'Use Python 3.9'
-        inputs:
-          versionSpec: '3.9'
-      - bash: apt-get update && apt-get install -y pandoc graphviz
-        displayName: 'install required debian packages'
-
-#      - task: Cache@2
-#        inputs:
-#          key: 'deploy_docs | "$(Agent.OS)" | setup.py | docs_requirements.txt'
-#          restoreKeys: |
-#            deploy_docs | "$(Agent.OS)"
-#            deploy_docs
-#          path: $(PIP_CACHE_DIR)
-#        displayName: 'cache pip packages'
-
-      - bash: pip install -U tox && pip install -r scripts/requirements.txt
-        displayName: 'install requirements'
-
-      - bash: tox -e docs-build-ci
-        displayName: 'build docs'
-
-      - task: DownloadSecureFile@1
-        inputs:
-          secureFile: deploy_key
-        displayName: 'Get the deploy key'
-        condition: |
-            and(not(eq(variables['Build.Reason'], 'PullRequest')),
-                eq(variables['Build.SourceBranch'], 'refs/heads/master'))
-
-      - script: |
-          mkdir -p ~/.ssh && mv $DOWNLOADSECUREFILE_SECUREFILEPATH ~/.ssh/id_rsa
-          chmod 700 ~/.ssh && chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts
-        condition: |
-            and(not(eq(variables['Build.Reason'], 'PullRequest')),
-                eq(variables['Build.SourceBranch'], 'refs/heads/master'))
-
-      - bash: ./scripts/deploy_docs docs/build/html/
-        displayName: 'deploy docs'
-        condition: |
-            and(not(eq(variables['Build.Reason'], 'PullRequest')),
-                eq(variables['Build.SourceBranch'], 'refs/heads/master'))
-
-      - script: |
-          rm -f ~/.ssh/id_rsa
-        condition: |
-            and(not(eq(variables['Build.Reason'], 'PullRequest')),
-                eq(variables['Build.SourceBranch'], 'refs/heads/master'))
-
-    - job: make_upload_packages
-      pool: DataAccess
-      steps:
-      - script: |  # need to get rid of old build stuff, packages etc.
-          rm -rf ./build/
-          rm -rf ./dist/
-          rm -f ./packaging/appimage/*.AppImage
-      - task: UsePythonVersion@0
-        displayName: 'Use Python 3.9'
-        inputs:
-          versionSpec: '3.9'
-#      - task: Cache@2
-#        inputs:
-#          key: 'deploy | "$(Agent.OS)" | scripts/requirements.txt'
-#          restoreKeys: |
-#            deploy | "$(Agent.OS)"
-#            deploy
-#          path: $(PIP_CACHE_DIR)
-#        displayName: 'cache pip packages'
-      - bash: pip install -U tox && pip install -r scripts/requirements.txt
-        displayName: 'install requirements'
-      - bash: python scripts/release --verbose upload --no-dry-run
-        displayName: 'Upload packages / release'
-        env:
-          LT_RELEASE_UPLOAD_PYPI_PASSWORD: $(LT_RELEASE_UPLOAD_PYPI_PASSWORD)
-          LT_RELEASE_UPLOAD_PYPI_TEST_PASSWORD: $(LT_RELEASE_UPLOAD_PYPI_TEST_PASSWORD)
-          LT_RELEASE_UPLOAD_TOKEN: $(LT_RELEASE_UPLOAD_TOKEN)
-          LT_RELEASE_UPLOAD_ZENODO_SANDBOX_TOKEN: $(LT_RELEASE_UPLOAD_ZENODO_SANDBOX_TOKEN)
-          LT_RELEASE_UPLOAD_ZENODO_TOKEN: $(LT_RELEASE_UPLOAD_ZENODO_TOKEN)
-          LT_RELEASE_UPLOAD_ZENODO_SANDBOX_PARENT: $(LT_RELEASE_UPLOAD_ZENODO_SANDBOX_PARENT)
-          LT_RELEASE_UPLOAD_ZENODO_PARENT: $(LT_RELEASE_UPLOAD_ZENODO_PARENT)

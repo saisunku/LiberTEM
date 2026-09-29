@@ -112,9 +112,26 @@ class MRCDataSet(DataSet):
     sync_offset: int, optional
         If positive, number of frames to skip from start
         If negative, number of blank frames to insert at start
+
+    num_partitions: int, optional
+        Override the number of partitions. This is useful if the
+        default number of partitions, chosen based on common workloads,
+        creates partitions which are too large (or small) for the UDFs
+        being run on this dataset.
     """
-    def __init__(self, path, nav_shape=None, sig_shape=None, sync_offset=0, io_backend=None):
-        super().__init__(io_backend=io_backend)
+    def __init__(
+        self,
+        path,
+        nav_shape=None,
+        sig_shape=None,
+        sync_offset=0,
+        io_backend=None,
+        num_partitions=None,
+    ):
+        super().__init__(
+            io_backend=io_backend,
+            num_partitions=num_partitions,
+        )
         if io_backend is not None:
             raise ValueError("MRCDataSet currently doesn't support alternative I/O backends")
         self._path = path
@@ -164,6 +181,11 @@ class MRCDataSet(DataSet):
 
     def initialize(self, executor):
         return executor.run_function(self._do_initialize)
+
+    def get_diagnostics(self):
+        return [
+            {"name": "dtype", "value": str(self._meta.raw_dtype)},
+        ]
 
     @classmethod
     def get_msg_converter(cls):

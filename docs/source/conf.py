@@ -67,6 +67,8 @@ extensions = [
     'IPython.sphinxext.ipython_console_highlighting',
     'sphinx_issues',
     'sphinx_rtd_theme',
+    'sphinx_toolbox.more_autodoc.autonamedtuple',
+    'enum_tools.autoenum',
 ]
 
 bibtex_bibfiles = ['references-libertem.bib']
@@ -131,6 +133,10 @@ html_static_path = ['_static']
 # 'searchbox.html']``.
 #
 # html_sidebars = {}
+
+html_css_files = [
+    'css/custom.css',
+]
 
 
 # -- Options for HTMLHelp output ---------------------------------------------
@@ -212,14 +218,13 @@ intersphinx_mapping = {
     'python': ('https://docs.python.org/3.10', None),
     'libertem_blobfinder': ('https://libertem.github.io/LiberTEM-blobfinder/', None),
     'ptychography40': ('https://ptychography-4-0.github.io/ptychography/', None),
+    'libertem_live': ('https://libertem.github.io/LiberTEM-live/', None),
 }
 
 # Sphinx' link checker.
 linkcheck_ignore = [
     # Local URLs:
     r'^http://localhost.*',
-    # Freezes the link checker for unknown reasons within CI, hard to reproduce
-    r'http://quantumdetectors.com/wp-content/uploads/2017/01/1532-Merlin-for-EM-Technical-Datasheet-v2.pdf',  # NOQA: E501
     # Apparently only for project members
     r'https://github.com/LiberTEM/LiberTEM/security/dependabot',
 ]

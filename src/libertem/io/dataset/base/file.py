@@ -1,4 +1,4 @@
-from typing import NamedTuple, Tuple
+from typing import NamedTuple
 import numpy as np
 
 from libertem.common.math import prod
@@ -44,7 +44,7 @@ class File:
         no direct match is possible (decoding is necessary),
         it falls back to bytes (np.uint8)
 
-    sig_shape : Shape | Tuple[int]
+    sig_shape : Shape | Tuple[int, ...]
         The shape of each signal element
 
     file_header: int
@@ -59,8 +59,8 @@ class File:
     def __init__(self, path, start_idx, end_idx,
                 native_dtype, sig_shape,
                 frame_footer=0, frame_header=0, file_header=0):
-        self._start_idx = start_idx
-        self._end_idx = end_idx
+        self._start_idx = int(start_idx)
+        self._end_idx = int(end_idx)
         self._native_dtype = native_dtype
         self._path = path
         self._file_header = file_header
@@ -85,7 +85,7 @@ class File:
         return self._end_idx - self._start_idx
 
     @property
-    def sig_shape(self) -> Tuple[int]:
+    def sig_shape(self) -> tuple[int, ...]:
         return self._sig_shape
 
     @property
@@ -124,6 +124,7 @@ class File:
                 (itemsize * frame_size) + self._frame_header + self._frame_footer
             )
             skip_end = (size - file_offset) - new_mmap_size
+        assert skip_end >= 0
 
         return OffsetsSizes(
             file_offset=file_offset,
@@ -158,9 +159,9 @@ class File:
         else:
             mem = mem[slicing.file_offset:]
         itemsize = np.dtype(self._native_dtype).itemsize
-        assert len(mem) % itemsize == 0,\
+        assert len(mem) % itemsize == 0, \
             "len(mem) must fit the dtype"
-        assert len(mem) // itemsize % self.num_frames == 0,\
+        assert len(mem) // itemsize % self.num_frames == 0, \
             "len(mem) must fit the number of frames"
         assert len(mem) // itemsize // self.num_frames % (
             slicing.frame_size + (self._frame_header + self._frame_footer) // itemsize
@@ -169,7 +170,7 @@ class File:
             (self.num_frames, -1)
         )
         arr = arr_uncut[:, slicing.frame_offset:slicing.frame_offset + slicing.frame_size]
-        assert arr.shape[1] == slicing.frame_size,\
+        assert arr.shape[1] == slicing.frame_size, \
             "array shape must fit the signal shape"
         assert arr.size > 0
         return arr

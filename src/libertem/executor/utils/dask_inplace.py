@@ -1,7 +1,10 @@
 from collections import namedtuple
 import itertools
+from numbers import Number
 
 import dask
+import numpy as np
+import numpy.typing as nt
 
 
 fake_np_flags = namedtuple('Flags', ['c_contiguous'])
@@ -78,13 +81,23 @@ class DaskInplaceWrapper:
             combined_slice = combine_slices_multid(self._slice, key, self._array.shape)
             return self._array[combined_slice]
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key, value: nt.ArrayLike | Number):
+        if not np.isscalar(value) and value.size == 1 and not isinstance(value, dask.array.Array):
+            # Avoids deprecated Numpy behaviour of implicitly
+            # extracting a scalar from an array during assignment
+            value = value.item()
         try:
             if self._slice is None:
                 self._array[key] = value
             else:
                 combined_slice = combine_slices_multid(self._slice, key, self._array.shape)
                 self._array[combined_slice] = value
+        except ValueError as e:
+            if not np.isscalar(value) and value.size == 0:
+                # Setting a zero-size slice is a no-op, but
+                # can raise a ValueError in Dask
+                return
+            raise e
         except NotImplementedError:
             raise NotImplementedError(
                 "Assignment into Dask array failed. This feature requires "

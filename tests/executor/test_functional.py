@@ -1,22 +1,30 @@
 import os
-import sys
+import time
 from glob import glob
 import concurrent.futures
 import multiprocessing.pool
+from typing import Any
 
 import pytest
 import distributed
 import dask
 import numpy as np
+from libertem.common.shape import Shape
+from libertem.common.slice import Slice
 
 from libertem.utils.devices import detect
 from libertem.executor.delayed import DelayedJobExecutor
 from libertem.executor.dask import DaskJobExecutor
 from libertem.executor.concurrent import ConcurrentJobExecutor
 from libertem.executor.inline import InlineJobExecutor
+from libertem.common.executor import (
+    Environment, TaskCommHandler, TaskProtocol, WorkerQueue,
+)
 from libertem.api import Context
 from libertem.udf.stddev import StdDevUDF
 from libertem.udf.masks import ApplyMasksUDF
+from libertem.udf.sum import SumUDF
+from libertem.common.exceptions import ExecutorSpecException
 from sparseconverter import (
     BACKENDS, CUPY, CUPY_BACKENDS, CUPY_SCIPY_CSR, NUMPY, SCIPY_COO, SPARSE_COO
 )
@@ -26,10 +34,11 @@ from utils import get_testdata_path
 
 d = detect()
 has_cupy = d['cudas'] and d['has_cupy']
+has_gpus = len(d['cudas']) > 0
 
 
 @pytest.fixture(
-    scope='session',
+    scope='module',
     params=[
         "inline", "dask_executor", "dask_make_default", "dask_integration",
         "concurrent", "delayed", "pipelined",
@@ -52,7 +61,10 @@ def ctx(request, local_cluster_url):
             yield Context(executor=DelayedJobExecutor())
     elif request.param == "dask_make_default":
         try:
-            ctx = Context.make_with('dask-make-default')
+            ctx = Context.make_with(
+                'dask-make-default',
+                cpus=4,
+            )
             yield ctx
         finally:
             # cleanup: Close cluster and client
@@ -73,25 +85,17 @@ def ctx(request, local_cluster_url):
     elif request.param == "delayed":
         yield Context(executor=DelayedJobExecutor())
     elif request.param == "pipelined":
-        if sys.version_info < (3, 8):
-            pytest.skip("PipelinedExecutor only supported from Python 3.8 onwards")
-        else:
-            from libertem.executor.pipelined import PipelinedExecutor
-            ctx = None
-            try:
-                ctx = Context(
-                    executor=PipelinedExecutor(
-                        spec=PipelinedExecutor.make_spec(cpus=range(2), cudas=[])
-                    )
-                )
-                yield ctx
-            finally:
-                if ctx is not None:
-                    ctx.close()
+        ctx = None
+        try:
+            ctx = Context.make_with('pipelined', cpus=range(2))
+            yield ctx
+        finally:
+            if ctx is not None:
+                ctx.close()
 
 
 @pytest.fixture(
-    scope='session',
+    scope='function',
     params=[
         # Only testing a selection of backends to keep the number of tests under control
         "HDF5", "RAW", "memory", SCIPY_COO, SPARSE_COO, CUPY, CUPY_SCIPY_CSR, "NPY", "BLO",
@@ -142,7 +146,7 @@ def load_kwargs(request, hdf5, default_raw, default_npy, default_npy_filepath, r
                 'path': blo_path,
             }
     elif param == 'DM':
-        dm_files = list(sorted(glob(os.path.join(testdata_path, 'dm', '*.dm4'))))
+        dm_files = list(sorted(glob(os.path.join(testdata_path, 'dm', '2018-7-17*.dm4'))))
         if dm_files:
             return {
                 'filetype': 'dm',
@@ -248,8 +252,10 @@ def _calculate(ctx, load_kwargs):
     return result, udfs
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope='function')
 def reference(load_kwargs):
+    # This must be function-scoped because load_kwargs is
+    # Could refactor the tests to avoid this recalculate if needed
     ctx = Context(executor=InlineJobExecutor())
     return _calculate(ctx, load_kwargs)
 
@@ -272,8 +278,26 @@ def test_executors(ctx, load_kwargs, reference):
             # To see what type we actually test
             print("is allclose", np.allclose(left, right))
             print("dtypes", left.dtype, right.dtype)
-            assert np.allclose(left, right),\
+            assert np.allclose(left, right), \
                 f"mismatching result for buffer {buf_key} in UDF {udfs[i]}"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    'flip', (True, False)
+)
+def test_tuple_list(flip, lt_ctx, load_kwargs):
+    default = lt_ctx.load(**load_kwargs)
+    sig_shape = default.shape.sig.to_tuple()
+    nav_shape = default.shape.nav.to_tuple()
+    if flip:
+        sig_shape = list(sig_shape)
+    else:
+        nav_shape = list(nav_shape)
+    load_kwargs['nav_shape'] = nav_shape
+    load_kwargs['sig_shape'] = sig_shape
+    ds = lt_ctx.load(**load_kwargs)
+    lt_ctx.run_udf(dataset=ds, udf=SumUDF())
 
 
 @pytest.mark.slow
@@ -292,6 +316,14 @@ def test_make_default():
             ctx.executor.client.cluster.close(timeout=30)
         ctx.executor.client.close()
         ctx.close()
+
+
+@pytest.mark.slow
+def test_make_dask_implicit():
+    with Context.make_with(cpus=(4, 7)) as ctx:
+        assert ctx.executor.__class__ == DaskJobExecutor
+        assert ctx.executor.client is not None
+        assert len(ctx.executor.get_available_workers().has_cpu()) == 2
 
 
 def test_connect_default(local_cluster_url):
@@ -382,3 +414,231 @@ def test_executor_run_each_host(ctx: Context):
     for k, v in res.items():
         assert k in workers.hosts()
         assert v == 43
+
+
+@pytest.mark.skipif(has_gpus, reason='Test to check error on no-GPU avail')
+def test_make_with_no_gpu():
+    with pytest.raises(ExecutorSpecException):
+        Context.make_with('dask', gpus=2)
+
+
+@pytest.mark.slow
+def test_make_with_scenarios():
+    """
+    Comment from @uellue on #1443:
+
+    I see several scenarios to use these parameters:
+
+    1. CPU defaults are OK, but I want to hand-craft and optimize my GPU worker setup
+    2. GPU defaults are OK/not applicable, but I need to optimize my CPU worker setup.
+    3. Co-optimize CPU and GPU setup
+    4. Disable all CPU or GPU workers.
+
+    For 1. and 2. it would be good if the user doesn't have to specify the CPU or
+    GPU setup to retain it at the defaults. For 4. it is easy to specify ...=0. For
+    that reason it would be better, IMO, if leaving a parameter at "None" keeps it
+    at the defaults.
+    """
+    # 1. CPU defaults are OK, but I want to hand-craft and optimize my GPU worker setup
+    try:
+        with Context.make_with('dask', gpus=2) as ctx:
+            assert len(ctx.executor.get_available_workers().has_cpu()) > 0
+            assert len(ctx.executor.get_available_workers().has_cuda()) == 2
+    except ExecutorSpecException:
+        assert not has_gpus, "should only happen if we have no GPUs available"
+
+    # 2. GPU defaults are OK/not applicable, but I need to optimize my CPU worker setup.
+    with Context.make_with('dask', cpus=2) as ctx:
+        assert len(ctx.executor.get_available_workers().has_cpu()) == 2
+        if has_gpus:
+            assert len(ctx.executor.get_available_workers().has_cuda()) > 0
+
+    # 3. Co-optimize CPU and GPU setup
+    try:
+        with Context.make_with('dask', cpus=2, gpus=2) as ctx:
+            assert len(ctx.executor.get_available_workers().has_cpu()) > 0
+            assert len(ctx.executor.get_available_workers().has_cuda()) == 2
+    except ExecutorSpecException:
+        assert not has_gpus, "should only happen if we have no GPUs available"
+
+    # 4.1 Disable all CPU* or GPU workers.
+    with Context.make_with('dask', cpus=0) as ctx:
+        assert len(ctx.executor.get_available_workers().has_cpu()) == 0
+        if has_gpus:
+            assert len(ctx.executor.get_available_workers().has_cuda()) > 0
+        else:
+            # FIXME: this should raise, as we don't have any non-service
+            # workers, correct?
+            pass
+
+    # 4.1 Disable all CPU or GPU* workers.
+    # (this should even be possible if no GPUs are available anyways)
+    with Context.make_with('dask', gpus=0) as ctx:
+        assert len(ctx.executor.get_available_workers().has_cpu()) > 0
+        assert len(ctx.executor.get_available_workers().has_cuda()) == 0
+
+
+class MockPartition:
+    @property
+    def slice(self):
+        return Slice(origin=(0, 0, 0), shape=Shape((16, 16, 16), sig_dims=1))
+
+
+class MockTask:
+    def __init__(self, delay):
+        self._delay = delay
+
+    def __call__(self, params, env: Environment) -> Any:
+        time.sleep(self._delay)
+        return params
+
+    def get_tracing_span_context(self):
+        raise NotImplementedError()
+
+    def get_partition(self):
+        return MockPartition()
+
+    def get_locations(self):
+        return None
+
+    def get_resources(self):
+        return {}
+
+
+class DelayingCommHandler(TaskCommHandler):
+    def handle_task(self, task: TaskProtocol, queue: WorkerQueue):
+        # our tests only work if the tasks don't all get submitted at the
+        # beginning of the `run_tasks` call - this simulates the live
+        # processing scenario
+        time.sleep(0.25)
+
+
+@pytest.mark.parametrize('executor', ['dask', 'pipelined', 'inline', 'concurrent'])
+def test_scatter_update(executor, local_cluster_ctx, pipelined_ctx, concurrent_executor):
+    import uuid
+    cancel_id = str(uuid.uuid4())
+
+    # we do this dance to re-use the existing executors, so we don't have to
+    # mark this test as slow:
+    if executor == 'dask':
+        ctx = local_cluster_ctx
+    elif executor == 'pipelined':
+        ctx = pipelined_ctx
+    elif executor == 'inline':
+        ctx = Context.make_with('inline')
+    elif executor == 'concurrent':
+        ctx = Context(executor=concurrent_executor)
+    else:
+        raise ValueError('invalid executor name')
+
+    print(f"starting for {executor}: {ctx.executor} {cancel_id}")
+
+    exc = ctx.executor
+    comm_handler = DelayingCommHandler()
+
+    # for concurrent, we need to take the number of threads into account,
+    # otherwise the tasks will start running too soon for the first update
+    # to take place
+    num_workers = sum(w.nthreads for w in exc.get_available_workers())
+
+    results = []
+
+    with exc.scatter('hello scatter') as handle:
+        tasks = []
+        # first two tasks: return immediately
+        # (this ensures we get to the point of changing the params faster)
+        tasks.append(MockTask(delay=0))
+        tasks.append(MockTask(delay=0))
+        # all that follow have some delay:
+        tasks.extend([MockTask(delay=0.025) for _ in range(300 * num_workers)])
+        result_iter = exc.run_tasks(
+            cancel_id=cancel_id,
+            params_handle=handle,
+            task_comm_handler=comm_handler,
+            tasks=tasks,
+        )
+        first_result, _task = next(result_iter)
+        print("started")
+        assert first_result == "hello scatter"
+        print(first_result)
+        exc.scatter_update(handle, 'new value')
+        for result, _task in result_iter:
+            results.append(result)
+            # early exit to keep test as fast as possible:
+            if result == "new value":
+                result_iter.close()
+                break
+
+    # eventually, the new value is available to the workers:
+    assert "new value" in results
+
+    print("done")
+
+
+@pytest.mark.parametrize('executor', ['dask', 'pipelined', 'inline', 'concurrent'])
+def test_scatter_patch(executor, local_cluster_ctx, pipelined_ctx, concurrent_executor):
+    import uuid
+    cancel_id = str(uuid.uuid4())
+
+    # we do this dance to re-use the existing executors, so we don't have to
+    # mark this test as slow:
+    if executor == 'dask':
+        ctx = local_cluster_ctx
+    elif executor == 'pipelined':
+        ctx = pipelined_ctx
+    elif executor == 'inline':
+        ctx = Context.make_with('inline')
+    elif executor == 'concurrent':
+        ctx = Context(executor=concurrent_executor)
+    else:
+        raise ValueError('invalid executor name')
+
+    print(f"starting for {executor}: {ctx.executor} {cancel_id}")
+
+    exc = ctx.executor
+    comm_handler = DelayingCommHandler()
+
+    # for concurrent, we need to take the number of threads into account,
+    # otherwise the tasks will start running too soon for the first update
+    # to take place
+    num_workers = sum(w.nthreads for w in exc.get_available_workers())
+
+    results = []
+
+    class Patchable:
+        def __init__(self, value):
+            self.value = value
+
+        def patch(self, patch):
+            self.value = patch
+
+        def __repr__(self):
+            return f"<Patchable: {self.value}>"
+
+    with exc.scatter(Patchable('hello scatter')) as handle:
+        tasks = []
+        tasks.append(MockTask(delay=0))
+        tasks.append(MockTask(delay=0))
+        tasks.extend([MockTask(delay=0.025) for _ in range(300 * num_workers)])
+        result_iter = exc.run_tasks(
+            cancel_id=cancel_id,
+            params_handle=handle,
+            task_comm_handler=comm_handler,
+            tasks=tasks,
+        )
+        first_result, _task = next(result_iter)
+        print("started")
+        assert first_result.value == "hello scatter"
+        print(first_result)
+        exc.scatter_update_patch(handle, 'new value')
+        for result, _task in result_iter:
+            results.append(result.value)
+            if result.value == "new value":
+                result_iter.close()
+                break
+
+    # eventually, the new value is available to the workers:
+    assert "new value" in results
+
+    print("done")
+    print(results)

@@ -106,6 +106,10 @@ export function* actionsFromChannel(socketChannel: SocketChannel) {
                     yield put(channelActions.Actions.jobStarted(msg.job, timestamp));
                     break;
                 }
+                case channelMessages.MessageTypes.JOB_PROGRESS: {
+                    yield put(channelActions.Actions.jobProgress(msg.job, msg.details));
+                    break;
+                }
                 case channelMessages.MessageTypes.FINISH_JOB: {
                     yield call(handleFinishJob, msg, socketChannel, timestamp);
                     break;
@@ -133,7 +137,19 @@ export function* actionsFromChannel(socketChannel: SocketChannel) {
                 }
                 case channelMessages.MessageTypes.CANCEL_JOB_FAILED: {
                     yield put(channelActions.Actions.cancelFailed(msg.job));
+                    break;
                 }
+                case channelMessages.MessageTypes.SNOOZE: {
+                    yield put(channelActions.Actions.snooze(timestamp));
+                    break;
+                }
+                case channelMessages.MessageTypes.UNSNOOZE: {
+                    yield put(channelActions.Actions.unsnooze(timestamp));
+                    break;
+                }
+                case channelMessages.MessageTypes.UNSNOOZE_DONE: {
+                    yield put(channelActions.Actions.unsnooze_done(timestamp));
+                }                
                 /*
                 // FIXME: server needs to know about compount analyses
                 case channelMessages.MessageTypes.ANALYSIS_CREATED: {

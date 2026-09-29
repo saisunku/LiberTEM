@@ -2,7 +2,6 @@ import os
 import re
 import glob
 import math
-import typing
 import logging
 import itertools
 
@@ -624,7 +623,7 @@ class DataBlock:
             return self._header
         header = {}
         for field, dtype in self.header_dtype:
-            if type(dtype) != str:
+            if type(dtype) is not str:
                 continue
             header[field] = self._header_raw[field][0]
         self._header = header
@@ -685,7 +684,7 @@ class K2FileSet(FileSet):
     def get_read_ranges(
         self, start_at_frame: int, stop_before_frame: int,
         dtype, tiling_scheme: TilingScheme, sync_offset: int = 0,
-        roi: typing.Union[np.ndarray, None] = None,
+        roi: np.ndarray | None = None,
     ):
         fileset_arr = self.get_as_arr()
         roi_nonzero = None
@@ -747,10 +746,32 @@ class K2ISDataSet(DataSet):
     sync_offset: int, optional
         If positive, number of frames to skip from start
         If negative, number of blank frames to insert at start
+
+    num_partitions: int, optional
+        Override the number of partitions. This is useful if the
+        default number of partitions, chosen based on common workloads,
+        creates partitions which are too large (or small) for the UDFs
+        being run on this dataset.
+
+    Examples
+    --------
+
+    >>> ds = ctx.load("k2is", path='./path_to_file.bin', ...)  # doctest: +SKIP
     """
 
-    def __init__(self, path, nav_shape=None, sig_shape=None, sync_offset=None, io_backend=None):
-        super().__init__(io_backend=io_backend)
+    def __init__(
+        self,
+        path,
+        nav_shape=None,
+        sig_shape=None,
+        sync_offset=None,
+        io_backend=None,
+        num_partitions=None,
+    ):
+        super().__init__(
+            io_backend=io_backend,
+            num_partitions=num_partitions,
+        )
         self._path = path
         self._start_offsets = None
         self._last_offsets = None

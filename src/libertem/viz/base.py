@@ -1,15 +1,97 @@
+import typing
 import logging
 import time
+import math
 
 import numpy as np
-from matplotlib import colors, cm
+# Makes colormaps available in matplotlib
+import colorcet  # noqa:F401
+from matplotlib import colors, cm, colormaps
+from skimage.color import rgb2luv, luv2rgb
 
 from libertem.udf.base import UDFRunner
 
 # Import here for backwards compatibility, refs #1031
 from libertem.common.viz import encode_image  # NOQA: F401
 
+if typing.TYPE_CHECKING:
+    from libertem.common.buffers import BufferWrapper
+
 logger = logging.getLogger(__name__)
+
+
+def _get_stat_limits(
+            data: np.ndarray, quantile: float = 0.001, snip_factor: float = 10.
+        ) -> tuple[float, float]:
+    """
+    Calculates robust min/max limits for auto-ranging by using the lower/upper quantiles.
+    Extreme values (e.g. outliers, "bad" pixels) are ignored this way.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Input data array.
+    quantile : float, optional
+        The fraction of data to ignore at each end (default: 0.001 for 0.1%).
+        For example, 0.005 means 0.5% at each end (0.005 and 0.995 quantiles).
+        Use 0 for no outlier rejection, higher values for more aggressive filtering.
+    snip_factor : float, optional
+        Use actual data limits and not quantile-filtered if data limits are close
+        to quantile limits by no more than snip_factor
+
+    Returns
+    -------
+    (vmin, vmax):
+        Robust min/max value for auto-ranging.
+    """
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        return 1.0, math.nextafter(1.0, math.inf)
+    vmin = float(np.real(data.min()))
+    vmax = float(np.real(data.max()))
+    q = float(quantile)
+    # Disregard zeros for the quantile calculation to
+    # better handle very sparse datasets
+    zeros = data == 0
+    has_zeros = np.any(zeros)
+    # Don't run quantile on empty array and confirm
+    # dtype is compatible with quantile
+    if (
+            not np.all(zeros)
+            and np.issubdtype(data.dtype, np.number)
+            and not np.issubdtype(data.dtype, np.complexfloating)
+    ):
+        lower, upper = np.quantile(data[np.invert(zeros)], (q, 1 - q))
+
+        # Expand limits to include 0 if any zeros are present.
+        if has_zeros:
+            lower = min(lower, 0)
+            upper = max(upper, 0)
+        # Select values within the quantile limits
+        filtered = data[(data >= lower) & (data <= upper)]
+        if filtered.size > 0:
+            filt_vmin = float(filtered.min())
+            filt_vmax = float(filtered.max())
+            # Only snip outliers if they are actually outliers,
+            # i.e. significantly larger or smaller than values within the quantile.
+            filt_vmin_diff = np.abs(filt_vmin - vmin)
+            filt_vmax_diff = np.abs(filt_vmax - vmax)
+            # Use the quantile limits as basis to determine ratio to differences
+            filt_vmin_base = np.abs(filt_vmin)
+            filt_vmax_base = np.abs(filt_vmax)
+            # filt_..._diff will be much larger than the filt_..._base if we
+            # have actual outliers.
+            if filt_vmin_base > 0:
+                vmin_quot = filt_vmin_diff / filt_vmin_base
+                if vmin_quot > snip_factor:
+                    vmin = filt_vmin
+            if filt_vmax_base > 0:
+                vmax_quot = filt_vmax_diff / filt_vmax_base
+                if vmax_quot > snip_factor:
+                    vmax = filt_vmax
+    if vmin == vmax:
+        vmax = math.nextafter(vmin, math.inf)
+    return vmin, vmax
 
 
 def _get_norm(result, norm_cls=colors.Normalize, vmin=None, vmax=None, damage=None):
@@ -22,14 +104,16 @@ def _get_norm(result, norm_cls=colors.Normalize, vmin=None, vmax=None, damage=No
         damage = (result != 0)
 
     damage = damage & np.isfinite(result)
+    valid_data = result[damage]
+    qmin, qmax = _get_stat_limits(valid_data)
 
     if damage.sum() == 0:
         return norm_cls(vmin=1, vmax=1)  # all-NaN or all-zero
 
     if vmin is None:
-        vmin = np.min(result[damage])
+        vmin = qmin
     if vmax is None:
-        vmax = np.max(result[damage])
+        vmax = qmax
 
     return norm_cls(vmin=vmin, vmax=vmax)
 
@@ -45,7 +129,7 @@ def visualize_simple(result, colormap=None, logarithmic=False, vmin=None, vmax=N
         2d array of intensity values
 
     colormap : matplotlib colormap or None
-        colormap used for visualizing intensity values, defaults to ColormapCubehelix()
+        colormap used for visualizing intensity values, defaults to matplotlib.cm.gist_earth
 
     Returns
     -------
@@ -69,6 +153,50 @@ def visualize_simple(result, colormap=None, logarithmic=False, vmin=None, vmax=N
     normalized = norm(result.reshape((-1,))).reshape(shape)
     colored = colormap(normalized, bytes=True)
     return colored
+
+
+cet_cyclic_isoluminant = colormaps.get_cmap('cet_cyclic_isoluminant')
+
+
+def rgb_from_2dvector(y, x, vmax=None):
+    y = np.asarray(y)
+    x = np.asarray(x)
+    absval = np.sqrt(np.abs(y)**2 + np.abs(x)**2)
+    if vmax is None:
+        vmax = np.max(absval[np.isfinite(absval)])
+    if vmax == 0:
+        vmax = 1
+    scaled_absval = absval / vmax
+    scaled_absval = np.minimum(scaled_absval, 1)
+    # Transform coordinates to match previous circular color map
+    angle = np.arctan2(-y, -x)
+    # Get color from isoluminant cyclic map of the angle
+    color = np.asarray(visualize_simple(
+        angle, colormap=cet_cyclic_isoluminant, vmin=-np.pi, vmax=np.pi
+    ))
+    # Transform to LUV space for linear axes
+    luv = rgb2luv(color[..., :3])
+    # Tweak luminance to match previous map
+    luv[..., 0] *= 0.8
+    # Adjust color intensity to roughly match previous implementation
+    color_scale = scaled_absval * 2.2
+    # Scale color
+    luv[..., 1] *= color_scale
+    luv[..., 2] *= color_scale
+    rgb = (luv2rgb(luv) * 255).astype(np.uint8)
+    return rgb
+
+
+def make_colormap():
+    angles = np.arange(360)
+    angles_rad = angles/180*np.pi
+    yy, xx = -np.sin(angles_rad), -np.cos(angles_rad)
+    cols = rgb_from_2dvector(y=yy, x=xx) / 255
+    cmap = colors.LinearSegmentedColormap.from_list('libertem_cyclic', cols)
+    return cmap
+
+
+libertem_cyclic = make_colormap()
 
 
 def get_plottable_2D_channels(buffers):
@@ -175,7 +303,9 @@ class Live2DPlot:
         """
         return self.udf
 
-    def extract(self, udf_results, damage):
+    def extract(
+        self, udf_results: dict[str, "BufferWrapper"], damage: "BufferWrapper"
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Extract plotting data from UDF result.
 
@@ -200,16 +330,13 @@ class Live2DPlot:
         """
         if self._extract is None:
             buffer = udf_results[self.channel]
-            squeezed = buffer.data.squeeze()
-            if buffer.kind == 'nav':
-                res_damage = damage
-            else:
-                res_damage = True
+            squeezed = buffer.masked_data.squeeze()
+            res_damage = buffer.valid_mask.squeeze()
             return (squeezed, res_damage)
         else:
             return self._extract(udf_results, damage)
 
-    def new_data(self, udf_results, damage, force=False):
+    def new_data(self, udf_results: dict[str, "BufferWrapper"], damage, force: bool = False):
         """
         This method is called with the raw `udf_results` any time a new
         partition has finished processing.

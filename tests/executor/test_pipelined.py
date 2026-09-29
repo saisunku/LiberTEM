@@ -1,8 +1,9 @@
 import functools
 import time
 import random
-from typing import Generator, Optional, TypeVar
-from multiprocessing import Process
+from typing import TypeVar
+from collections.abc import Generator
+import multiprocessing as mp
 import sys
 import subprocess
 
@@ -10,12 +11,17 @@ import pytest
 import numpy as np
 
 from libertem.api import Context
+from libertem.common.executor import (
+    TaskCommHandler, TaskProtocol, WorkerQueue, JobCancelledError,
+)
 from libertem.udf.sum import SumUDF
 from libertem.executor.pipelined import (
     PipelinedExecutor, WorkerPool, _order_results, pipelined_worker
 )
 import libertem.executor.pipelined
 from libertem.udf import UDF
+from libertem.common.exceptions import UDFRunCancelled
+from libertem.io.dataset.memory import MemoryDataSet
 
 
 class CustomException(Exception):
@@ -85,6 +91,7 @@ def test_udf_exception_queued(pipelined_ex):
     ctx.run_udf(dataset=ds, udf=normal_udf)
 
 
+@pytest.mark.slow
 def test_default_spec():
     # make sure `.make_local` works:
     executor = None
@@ -99,7 +106,7 @@ def test_default_spec():
 
 
 def test_make_with():
-    with Context.make_with("pipelined") as ctx:
+    with Context.make_with("pipelined", cpus=1) as ctx:
         assert ctx.executor.run_function(lambda: 42) == 42
 
 
@@ -108,7 +115,7 @@ _STOP = object()
 T = TypeVar('T')
 
 
-def echo() -> Generator[Optional[T], T, None]:
+def echo() -> Generator[T | None, T, None]:
     last = None
     while last is not _STOP:
         print(f"yielding {last}")
@@ -230,7 +237,7 @@ def test_run_function_error():
             executor.close()
 
 
-def _broken_pipelined_worker(queues, pin, spec, span_context):
+def _broken_pipelined_worker(queues, pin, spec, span_context, early_setup):
     raise CustomException("stuff is broken, can't do it.")
 
 
@@ -354,36 +361,36 @@ def test_make_spec_multi_cuda():
     assert spec == [
         {
             "device_id": 0,
-            "name": "cpu-0",
-            "device_kind": "CPU",
-            "worker_idx": 0,
-            "has_cupy": False,
-        },
-        {
-            "device_id": 0,
             "name": "cuda-0-0",
             "device_kind": "CUDA",
-            "worker_idx": 1,
+            "worker_idx": 0,
             "has_cupy": False,
         },
         {
             "device_id": 1,
             "name": "cuda-1-0",
             "device_kind": "CUDA",
-            "worker_idx": 2,
+            "worker_idx": 1,
             "has_cupy": False,
         },
         {
             "device_id": 2,
             "name": "cuda-2-0",
             "device_kind": "CUDA",
-            "worker_idx": 3,
+            "worker_idx": 2,
             "has_cupy": False,
         },
         {
             "device_id": 2,
             "name": "cuda-2-1",
             "device_kind": "CUDA",
+            "worker_idx": 3,
+            "has_cupy": False,
+        },
+        {
+            "device_id": 0,
+            "name": "cpu-0",
+            "device_kind": "CPU",
             "worker_idx": 4,
             "has_cupy": False,
         },
@@ -407,10 +414,10 @@ def test_make_spec_cuda_int():
 
 
 def test_close_with_scatter():
-    # make sure `.make_local` works:
     executor = None
     try:
-        executor = PipelinedExecutor.make_local()
+        spec = PipelinedExecutor.make_spec(cpus=range(2), cudas=[])
+        executor = PipelinedExecutor(spec=spec, pin_workers=False)
         with executor.scatter("huh"):
             executor.close()
     finally:
@@ -421,19 +428,23 @@ def test_close_with_scatter():
 def test_exception_in_main_thread():
     executor = None
     try:
-        executor = PipelinedExecutor.make_local()
+        spec = PipelinedExecutor.make_spec(cpus=range(2), cudas=[])
+        executor = PipelinedExecutor(spec=spec, pin_workers=False)
         ctx = Context(executor=executor)
         udf = SucceedEventuallyUDF()
         data = np.random.randn(1, 32, 16, 16)
         ds = ctx.load("memory", data=data, num_partitions=32)
+        res_iter = ctx.run_udf_iter(dataset=ds, udf=udf)
         with pytest.raises(RuntimeError):
-            res_iter = ctx.run_udf_iter(dataset=ds, udf=udf)
             next(res_iter)
             res_iter.throw(RuntimeError("stuff"))
             next(res_iter)
+        res_iter.close()
 
         # here, we get a KeyError if the worker queues aren't drained:
+        print("second UDF run starting")
         ctx.run_udf(dataset=ds, udf=udf)
+        print("second UDF run done")
     finally:
         if executor is not None:
             executor.close()
@@ -473,7 +484,7 @@ def _teardown_manual():
         '-c',
         'import time;'
         'from libertem.api import Context;'
-        'ctx=Context.make_with("pipelined");'
+        'ctx=Context.make_with("pipelined", cpus=1);'
         'time.sleep(0.2);'
         'ctx.close()'
     ], timeout=30)
@@ -485,7 +496,7 @@ def test_auto_teardown_1():
         '-c',
         'import time;'
         'from libertem.api import Context;'
-        'ctx=Context.make_with("pipelined");'
+        'ctx=Context.make_with("pipelined", cpus=1);'
     ], timeout=30)
 
 
@@ -496,16 +507,61 @@ def test_auto_teardown_2():
         'import time;'
         'import gc;'
         'from libertem.api import Context;'
-        'Context.make_with("pipelined");'
+        'Context.make_with("pipelined", cpus=1);'
         'gc.collect();'
     ], timeout=30)
 
 
 def test_manual_teardown():
-    p = Process(target=_teardown_manual, name="_teardown_manual")
+    mp_ctx = mp.get_context("spawn")
+    p = mp_ctx.Process(target=_teardown_manual, name="_teardown_manual")
     p.start()
     p.join(30)
     exitcode = p.exitcode
     if exitcode != 0:
         p.terminate()
         raise RuntimeError(f"exitcode is {exitcode}, should be 0")
+
+
+class CancelledTaskCommHandler(TaskCommHandler):
+    def handle_task(self, task: TaskProtocol, queue: WorkerQueue):
+        raise JobCancelledError()
+
+    def start(self):
+        pass
+
+    def done(self):
+        pass
+
+
+class CancelledMemoryDataSet(MemoryDataSet):
+    def get_task_comm_handler(self) -> TaskCommHandler:
+        return CancelledTaskCommHandler()
+
+
+def test_cancellation(pipelined_ex, default_raw):
+    executor = pipelined_ex
+    ctx = Context(executor=executor)
+
+    cancel_ds = CancelledMemoryDataSet(data=np.zeros((16, 16, 16, 16)))
+
+    with pytest.raises(UDFRunCancelled) as ex:
+        ctx.run_udf(dataset=cancel_ds, udf=SumUDF())
+
+    assert ex.match(r"^UDF run cancelled after \d+ partitions$")
+
+    # after cancellation, the executor is still usable:
+    _ = ctx.run_udf(dataset=default_raw, udf=SumUDF())
+
+
+def test_with_progress(pipelined_ex, default_raw):
+    executor = pipelined_ex
+    ctx = Context(executor=executor)
+
+    udf = SumUDF()
+    res_iter = ctx.run_udf_iter(dataset=default_raw, udf=udf, progress=True)
+    try:
+        for res in res_iter:
+            pass
+    finally:
+        res_iter.close()

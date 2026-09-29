@@ -4,6 +4,7 @@ import numpy as np
 from ...common.math import prod
 from ...common.slice import Slice
 from ...common.buffers import BufferWrapper
+from ...common.compat import copy_if_needed
 from .dask_inplace import DaskInplaceWrapper
 
 
@@ -183,10 +184,11 @@ class DaskResultBufferWrapper(DaskPreallocBufferWrapper):
         result._ds_partitions = buffer._ds_partitions
         result._roi = buffer._roi
         result._roi_is_zero = buffer._roi_is_zero
+        result._valid_mask = buffer._valid_mask
         return result
 
-    def __array__(self):
-        return super().__array__()
+    def __array__(self, copy=copy_if_needed, dtype=None):
+        return super().__array__(copy=copy, dtype=dtype)
 
     @property
     def raw_data(self):

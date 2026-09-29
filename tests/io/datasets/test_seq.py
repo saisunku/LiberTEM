@@ -21,7 +21,11 @@ from utils import get_testdata_path, ValidationUDF, roi_as_sparse
 import defusedxml.ElementTree as ET
 
 try:
-    import pims
+    # FIXME: pims/skimage can't deal with numpy2 on python 3.9
+    if int(np.version.version.split('.')[0]) < 2 or sys.version_info >= (3, 10):
+        import pims
+    else:
+        pims = None
 except ModuleNotFoundError:
     pims = None
 
@@ -39,9 +43,9 @@ def default_seq(lt_ctx):
         path=SEQ_TESTDATA_PATH,
         nav_shape=nav_shape,
         io_backend=MMapBackend(),
+        num_partitions=4,
     )
 
-    ds.set_num_cores(4)
     assert tuple(ds.shape) == (8, 8, 128, 128)
     return ds
 
@@ -55,9 +59,9 @@ def buffered_seq(lt_ctx):
         path=SEQ_TESTDATA_PATH,
         nav_shape=nav_shape,
         io_backend=BufferedBackend(),
+        num_partitions=4,
     )
 
-    ds.set_num_cores(4)
     return ds
 
 
@@ -70,9 +74,9 @@ def direct_seq(lt_ctx):
         path=SEQ_TESTDATA_PATH,
         nav_shape=nav_shape,
         io_backend=DirectBackend(),
+        num_partitions=4,
     )
 
-    ds.set_num_cores(4)
     return ds
 
 
@@ -110,9 +114,9 @@ def test_positive_sync_offset(default_seq, lt_ctx):
     sync_offset = 2
 
     ds_with_offset = SEQDataSet(
-        path=SEQ_TESTDATA_PATH, nav_shape=(8, 8), sync_offset=sync_offset
+        path=SEQ_TESTDATA_PATH, nav_shape=(8, 8), sync_offset=sync_offset,
+        num_partitions=4,
     )
-    ds_with_offset.set_num_cores(4)
     ds_with_offset = ds_with_offset.initialize(lt_ctx.executor)
     ds_with_offset.check_valid()
 
@@ -129,8 +133,11 @@ def test_positive_sync_offset(default_seq, lt_ctx):
         dataset_shape=ds_with_offset.shape,
     )
 
-    t0 = next(p0.get_tiles(tiling_scheme))
+    tiles = p0.get_tiles(tiling_scheme)
+    t0 = next(tiles)
     assert tuple(t0.tile_slice.origin) == (0, 0, 0)
+    for _ in tiles:
+        pass
 
     for p in ds_with_offset.get_partitions():
         for t in p.get_tiles(tiling_scheme=tiling_scheme):
@@ -441,9 +448,9 @@ def test_negative_sync_offset(default_seq, lt_ctx):
     sync_offset = -2
 
     ds_with_offset = SEQDataSet(
-        path=SEQ_TESTDATA_PATH, nav_shape=(8, 8), sync_offset=sync_offset
+        path=SEQ_TESTDATA_PATH, nav_shape=(8, 8), sync_offset=sync_offset,
+        num_partitions=4,
     )
-    ds_with_offset.set_num_cores(4)
     ds_with_offset = ds_with_offset.initialize(lt_ctx.executor)
     ds_with_offset.check_valid()
 
@@ -460,8 +467,11 @@ def test_negative_sync_offset(default_seq, lt_ctx):
         dataset_shape=ds_with_offset.shape,
     )
 
-    t0 = next(p0.get_tiles(tiling_scheme))
+    tiles = p0.get_tiles(tiling_scheme)
+    t0 = next(tiles)
     assert tuple(t0.tile_slice.origin) == (2, 0, 0)
+    for _ in tiles:
+        pass
 
     for p in ds_with_offset.get_partitions():
         for t in p.get_tiles(tiling_scheme=tiling_scheme):
@@ -483,8 +493,11 @@ def test_negative_sync_offset(default_seq, lt_ctx):
 def test_missing_frames(lt_ctx):
     nav_shape = (16, 8)
 
-    ds = SEQDataSet(path=SEQ_TESTDATA_PATH, nav_shape=nav_shape)
-    ds.set_num_cores(4)
+    ds = SEQDataSet(
+        path=SEQ_TESTDATA_PATH,
+        nav_shape=nav_shape,
+        num_partitions=4,
+    )
     ds = ds.initialize(lt_ctx.executor)
     ds.check_valid()
 
@@ -515,9 +528,11 @@ def test_missing_data_with_positive_sync_offset(lt_ctx):
     sync_offset = 8
 
     ds = SEQDataSet(
-        path=SEQ_TESTDATA_PATH, nav_shape=nav_shape, sync_offset=sync_offset
+        path=SEQ_TESTDATA_PATH,
+        nav_shape=nav_shape,
+        sync_offset=sync_offset,
+        num_partitions=4,
     )
-    ds.set_num_cores(4)
     ds = ds.initialize(lt_ctx.executor)
 
     tileshape = Shape(
@@ -545,9 +560,11 @@ def test_missing_data_with_negative_sync_offset(lt_ctx):
     sync_offset = -8
 
     ds = SEQDataSet(
-        path=SEQ_TESTDATA_PATH, nav_shape=nav_shape, sync_offset=sync_offset
+        path=SEQ_TESTDATA_PATH,
+        nav_shape=nav_shape,
+        sync_offset=sync_offset,
+        num_partitions=4,
     )
-    ds.set_num_cores(4)
     ds = ds.initialize(lt_ctx.executor)
 
     tileshape = Shape(
@@ -573,8 +590,11 @@ def test_missing_data_with_negative_sync_offset(lt_ctx):
 def test_too_many_frames(lt_ctx):
     nav_shape = (4, 8)
 
-    ds = SEQDataSet(path=SEQ_TESTDATA_PATH, nav_shape=nav_shape)
-    ds.set_num_cores(4)
+    ds = SEQDataSet(
+        path=SEQ_TESTDATA_PATH,
+        nav_shape=nav_shape,
+        num_partitions=4,
+    )
     ds = ds.initialize(lt_ctx.executor)
     ds.check_valid()
 
@@ -826,3 +846,24 @@ def test_scheme_too_large(default_seq):
     tiles = p.get_tiles(tiling_scheme=tiling_scheme)
     t = next(tiles)
     assert tuple(t.tile_slice.shape) == tuple((depth,) + default_seq.shape.sig)
+    for _ in tiles:
+        pass
+
+
+def test_bad_params(ds_params_tester, standard_bad_ds_params):
+    args = ("seq", SEQ_TESTDATA_PATH)
+    for params in standard_bad_ds_params:
+        if "nav_shape" not in params:
+            params['nav_shape'] = (8, 8)
+        ds_params_tester(*args, **params)
+
+
+@needsdata
+def test_no_num_partitions(lt_ctx):
+    nav_shape = (8, 8)
+    ds = lt_ctx.load(
+        "seq",
+        path=SEQ_TESTDATA_PATH,
+        nav_shape=nav_shape,
+    )
+    lt_ctx.run_udf(dataset=ds, udf=SumSigUDF())

@@ -17,6 +17,7 @@ from libertem.udf.sumsigudf import SumSigUDF
 from libertem.udf.masks import ApplyMasksUDF
 from libertem.udf.stddev import StdDevUDF
 from libertem.common.math import prod
+from libertem.web.dataset import prime_numba_cache
 
 from utils import _mk_random, get_testdata_path
 
@@ -256,6 +257,7 @@ def real_csr_data(lt_ctx):
     yield lt_ctx.load("raw_csr", path=RAW_CSR_TESTDATA_PATH)
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not HAVE_CSR_TESTDATA, reason="need raw CSR testdata")
 def test_sum_real_data(real_csr_data, local_cluster_ctx):
     udf = SumUDF()
@@ -265,6 +267,7 @@ def test_sum_real_data(real_csr_data, local_cluster_ctx):
     # assert np.allclose(ref, res['intensity'].data.reshape((-1,)))
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not HAVE_CSR_TESTDATA, reason="need raw CSR testdata")
 def test_sum_real_data_roi(real_csr_data, local_cluster_ctx):
     udf = SumUDF()
@@ -281,7 +284,10 @@ def test_detect_params(raw_csr_generated, default_raw, inline_executor):
 
 
 def test_diagnostics(raw_csr_generated):
-    raw_csr_generated.diagnostics
+    diags = raw_csr_generated.diagnostics
+    assert {"name": "data dtype", "value": "float32"} in diags
+    assert {"name": "indptr dtype", "value": "int32"} in diags
+    assert {"name": "indices dtype", "value": "int32"} in diags
 
 
 def test_exception_at_detect(tmpdir_factory, dask_executor):
@@ -323,23 +329,21 @@ def test_sig_nav_shape(raw_csr_generated, lt_ctx):
 
 @pytest.mark.slow
 @pytest.mark.parametrize(
-    'sync_offset', (
-        0, 1, -1, -10, 13, 13*15, -13*14,
-        np.random.randint(low=-13*17+1, high=13*17),
-        -13*17+1,
-        13*17-1,
+    'nav_shape', (
+        None,
+        (14, 14),
+        (47, 13),
+        "random1d",
+        "random2d",
+        "random3d",
     ),
 )
 @pytest.mark.parametrize(
-    'nav_shape', (
-        None, (14, 14), (47, 13),
-        (np.random.randint(low=1, high=13*18), ),
-        (np.random.randint(low=1, high=13*18), np.random.randint(low=1, high=13*18)),
-        (
-            np.random.randint(low=1, high=13*18),
-            np.random.randint(low=1, high=13*18),
-            np.random.randint(low=1, high=13*18)
-        ),
+    'sync_offset', (
+        0, 1, -1, -10, 13, 13*15, -13*14,
+        "random",
+        -13*17+1,
+        13*17-1,
     ),
 )
 @pytest.mark.parametrize(
@@ -352,6 +356,22 @@ def test_sig_nav_shape(raw_csr_generated, lt_ctx):
 )
 def test_reshape_sync_offset(
         raw_csr_generated, mock_sparse_data, lt_ctx, sync_offset, nav_shape, sig_shape, use_roi):
+    if sync_offset == 'random':
+        sync_offset = np.random.randint(low=-13*17+1, high=13*17)
+    if nav_shape == 'random1d':
+        nav_shape = (np.random.randint(low=1, high=13*18),)
+    elif nav_shape == 'random2d':
+        nav_shape = (
+            np.random.randint(low=1, high=13*18),
+            np.random.randint(low=1, high=13*18),
+        )
+    elif nav_shape == 'random3d':
+        nav_shape = (
+            np.random.randint(low=1, high=13*18),
+            np.random.randint(low=1, high=13*18),
+            np.random.randint(low=1, high=13*18),
+        )
+
     orig, data_flat = mock_sparse_data
     data = data_flat.reshape(raw_csr_generated.shape)
     # Otherwise memory and raw_csr use different approach to determine shape
@@ -406,16 +426,26 @@ def test_reshape_sync_offset(
 
     assert_allclose(
         ref_result[0]['intensity'].raw_data,
-        result[0]['intensity'].raw_data
+        result[0]['intensity'].raw_data,
+        rtol=1e-5,
+        atol=1e-8,
     )
     assert_allclose(
         ref_result[1]['std'].raw_data,
-        result[1]['std'].raw_data
+        result[1]['std'].raw_data,
+        rtol=1e-5,
+        atol=1e-8,
     )
     assert_allclose(
         ref_result[1]['num_frames'].raw_data,
-        result[1]['num_frames'].raw_data
+        result[1]['num_frames'].raw_data,
+        rtol=1e-5,
+        atol=1e-8,
     )
+
+
+def test_uint64ptr(lt_ctx_fast, raw_csr_generated_uint64):
+    prime_numba_cache(raw_csr_generated_uint64)
 
 
 def test_large_file_detect(monkeypatch, default_raw, inline_executor_fast):
@@ -434,3 +464,13 @@ def test_large_file_detect(monkeypatch, default_raw, inline_executor_fast):
     detects = RawCSRDataSet.detect_params(filepath, inline_executor_fast)
     assert not detects
     assert not load_called
+
+
+@pytest.mark.skipif(not HAVE_CSR_TESTDATA, reason="need raw CSR testdata")
+def test_num_partitions(lt_ctx):
+    ds = lt_ctx.load(
+        "raw_csr",
+        path=RAW_CSR_TESTDATA_PATH,
+        num_partitions=129,
+    )
+    assert len(list(ds.get_partitions())) == 129

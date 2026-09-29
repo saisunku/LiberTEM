@@ -3,7 +3,6 @@ import functools
 
 import numpy as np
 import numba
-from sparseconverter import SPARSE_BACKENDS
 
 from libertem.udf import UDF
 from libertem.common.buffers import reshaped_view
@@ -260,14 +259,14 @@ class StdDevUDF(UDF):
     The one-pass algorithm used in this code is taken from the following
     paper: :cite:`Schubert2018`.
 
-    ..versionchanged:: 0.5.0
+    .. versionchanged:: 0.5.0
         Result buffers have been renamed
 
-    ..versionchanged:: 0.7.0
+    .. versionchanged:: 0.7.0
         :code:`var`, :code:`mean`, and :code:`std` are now returned directly
         from the UDF via :code:`get_results`.
 
-    ..versionchanged:: 0.11
+    .. versionchanged:: 0.11
         added dtype and use_numba parameters, added support for sparse input.
 
     Parameters
@@ -304,19 +303,10 @@ class StdDevUDF(UDF):
         # TODO supporting sparse backends efficiently requires a dedicated implementation
         # since the generic one calculates the difference from a mean value,
         # which can densify a sparse array.
-        return tuple(b for b in self.BACKEND_ALL if b not in SPARSE_BACKENDS)
+        return tuple(b for b in self.BACKEND_ALL if b not in self.SPARSE_BACKENDS)
 
     def get_result_buffers(self):
-        """
-        Initializes BufferWrapper objects for sum of variances,
-        sum of frames, and the number of frames
-
-        Returns
-        -------
-        dict
-            A dictionary that maps 'varsum',  'num_frames', 'sum' to
-            the corresponding BufferWrapper objects
-        """
+        ''
         base_dtype = self.params.dtype
         if base_dtype is None:
             base_dtype = np.float64
@@ -344,28 +334,27 @@ class StdDevUDF(UDF):
 
     def get_task_data(self):
         return {
-            'num_frames': defaultdict(lambda: 0)
+            'num_frames': defaultdict(int)
         }
 
     def postprocess(self):
         self.results.num_frames[:] = _validate_n(self.task_data.num_frames)
 
     def merge(self, dest, src):
-        """
-        Given destination and source buffers that contain sum of variances, sum of frames,
-        and the number of frames used in each of the buffers, merge the source
-        buffers into the destination buffers by computing the joint sum of variances and
-        sum of frames over all frames used
+        ''
+        # Given destination and source buffers that contain sum of variances, sum of frames,
+        # and the number of frames used in each of the buffers, merge the source
+        # buffers into the destination buffers by computing the joint sum of variances and
+        # sum of frames over all frames used
 
-        Parameters
-        ----------
-        dest
-            Aggregation bufer that contains sum of variances, sum of frames, and the
-            number of frames
-        src
-            Partial results that contains sum of variances, sum of frames, and the
-            number of frames of a partition to be merged into the aggregation buffers
-        """
+        # Parameters
+        # ----------
+        # dest
+        #     Aggregation bufer that contains sum of variances, sum of frames, and the
+        #     number of frames
+        # src
+        #     Partial results that contains sum of variances, sum of frames, and the
+        #     number of frames of a partition to be merged into the aggregation buffers
         dest_n = dest.num_frames[0]
         src_n = src.num_frames[0]
 
@@ -386,6 +375,7 @@ class StdDevUDF(UDF):
         dest.num_frames[:] = n
 
     def merge_all(self, ordered_results):
+        ''
         n_frames = np.stack([b.num_frames[0] for b in ordered_results.values()])
         pixel_sums = np.stack([b.sum for b in ordered_results.values()])
         pixel_varsums = np.stack([b.varsum for b in ordered_results.values()])
@@ -431,15 +421,8 @@ class StdDevUDF(UDF):
             return input
 
     def process_tile(self, tile):
-        """
-        Calculate a sum and variance minibatch for the tile and update partition buffers
-        with it.
-
-        Parameters
-        ----------
-        tile
-            tile of the data
-        """
+        # Calculate a sum and variance minibatch for the tile and update partition buffers
+        # with it.
         key = self.meta.tiling_scheme_idx
         n_0 = self.task_data.num_frames[key]
         n_1 = tile.shape[0]
@@ -470,16 +453,8 @@ class StdDevUDF(UDF):
             )
 
     def get_results(self):
-        '''
-        Calculate variance, mean and standard deviation from raw UDF results
-
-        Returns
-        -------
-        pass_results : Dict[str, BufferWrapper]
-            Result dictionary with keys
-            :code:`'sum', 'varsum', 'num_frames', 'var', 'std', and 'mean'`
-            as :code:`BufferWrapper`
-        '''
+        ''
+        # Calculate variance, mean and standard deviation from raw UDF results
         num_frames = self.results.num_frames[0]
 
         var = self.results.varsum / num_frames
@@ -530,10 +505,10 @@ def run_stddev(ctx, dataset, roi=None, progress=False, use_numba=True):
     One-pass algorithm used in this code is taken from the following paper:
     :cite:`Schubert2018`.
 
-    ..versionchanged:: 0.5.0
+    .. versionchanged:: 0.5.0
         Result buffers have been renamed
 
-    ..versionchanged:: 0.5.0
+    .. versionchanged:: 0.5.0
         Added :code:`progress` parameter for progress bar
 
     Parameters

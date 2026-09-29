@@ -1,5 +1,5 @@
 import typing
-from typing import Generator, Optional, Sequence, Tuple
+from collections.abc import Generator, Sequence
 
 import numpy as np
 from sparseconverter import CUDA, NUMPY, ArrayBackend
@@ -18,18 +18,34 @@ if typing.TYPE_CHECKING:
     from numpy import typing as nt
 
 
+class RoiHelper:
+    def __init__(self, ds):
+        self._ds = ds
+
+    def __getitem__(self, k):
+        roi = np.zeros(self._ds.shape.nav, dtype=bool)
+        roi[k] = True
+        return roi
+
+
 class DataSet:
     # The default partition size in bytes
     MAX_PARTITION_SIZE = 512*1024*1024
 
-    def __init__(self, io_backend: Optional["IOBackend"] = None):
+    def __init__(
+        self,
+        io_backend: typing.Optional["IOBackend"] = None,
+        num_partitions: int | None = None,
+    ):
         self._cores = 1
-        self._sync_offset: Optional[int] = 0
+        self._sync_offset: int | None = 0
         self._sync_offset_info = None
         self._image_count = 0
         self._nav_shape_product = 0
         self._io_backend = io_backend
-        self._meta: Optional[DataSetMeta] = None
+        self._user_num_partitions = num_partitions
+        self._meta: DataSetMeta | None = None
+        self._roi_helper = RoiHelper(ds=self)
 
     def initialize(self, executor) -> "DataSet":
         """
@@ -80,10 +96,14 @@ class DataSet:
         native dtype. At least :code:`self._cores` partitions
         are created.
         """
+        if self._user_num_partitions is not None:
+            return max(1, self._user_num_partitions)
         partition_size_float_px = self.MAX_PARTITION_SIZE // 4
         dataset_size_px = prod(self.shape)
-        num: int = max(self._cores, dataset_size_px // partition_size_float_px)
-        return num
+        cores = max(1, self._cores)
+        num = dataset_size_px // partition_size_float_px
+        num_per_core = num // cores + min(1, num % cores)
+        return max(1, num_per_core) * cores
 
     def get_slices(self):
         """
@@ -150,7 +170,7 @@ class DataSet:
         raise NotImplementedError()
 
     @classmethod
-    def get_msg_converter(cls) -> typing.Type[MessageConverter]:
+    def get_msg_converter(cls) -> type[MessageConverter]:
         raise NotImplementedError()
 
     @property
@@ -183,13 +203,17 @@ class DataSet:
         """
         return []
 
+    @property
+    def roi(self):
+        return self._roi_helper
+
     def partition_shape(
         self,
         dtype: "nt.DTypeLike",
         target_size: int,
-        min_num_partitions: Optional[int] = None,
-        containing_shape: Optional[Shape] = None,
-    ) -> typing.Tuple[int, ...]:
+        min_num_partitions: int | None = None,
+        containing_shape: Shape | None = None,
+    ) -> tuple[int, ...]:
         """
         Calculate partition shape for the given ``target_size``
 
@@ -206,7 +230,7 @@ class DataSet:
 
         Returns
         -------
-        Tuple[int]
+        Tuple[int, ...]
             the shape calculated from the given parameters
         """
         if min_num_partitions is None:
@@ -216,11 +240,12 @@ class DataSet:
         return get_partition_shape(
             dataset_shape=containing_shape,
             target_size_items=target_size // np.dtype(dtype).itemsize,
-            min_num=min_num_partitions
+            min_num=min_num_partitions,
+            num_cores=self._cores,
         )
 
     @classmethod
-    def get_supported_extensions(cls) -> typing.Set[str]:
+    def get_supported_extensions(cls) -> set[str]:
         """
         Return supported extensions as a set of strings.
 
@@ -240,7 +265,7 @@ class DataSet:
         return MMapBackend()
 
     @classmethod
-    def get_supported_io_backends(cls) -> typing.List[str]:
+    def get_supported_io_backends(cls) -> list[str]:
         """
         Get the supported I/O backends as list of their IDs. Some DataSet
         implementations with a custom backend may return an empty list here.
@@ -267,15 +292,15 @@ class DataSet:
     def supports_correction(self):
         return True
 
-    def get_decoder(self) -> Optional["Decoder"]:
+    def get_decoder(self) -> typing.Optional["Decoder"]:
         return None
 
-    def get_base_shape(self, roi: Optional[np.ndarray]) -> Tuple[int, ...]:
+    def get_base_shape(self, roi: np.ndarray | None) -> tuple[int, ...]:
         return (1,) + (1,) * (self.shape.sig.dims - 1) + (self.shape.sig[-1],)
 
     def adjust_tileshape(
-        self, tileshape: Tuple[int, ...], roi: Optional[np.ndarray]
-    ) -> Tuple[int, ...]:
+        self, tileshape: tuple[int, ...], roi: np.ndarray | None
+    ) -> tuple[int, ...]:
         """
         Final veto of the DataSet in the tileshape negotiation process,
         make sure that corrections are taken into account!
@@ -285,8 +310,8 @@ class DataSet:
     def need_decode(
         self,
         read_dtype: "nt.DTypeLike",
-        roi: Optional[np.ndarray],
-        corrections: Optional[CorrectionSet],
+        roi: np.ndarray | None,
+        corrections: CorrectionSet | None,
     ) -> bool:
         io_backend = self.get_io_backend().get_impl()
         return io_backend.need_copy(
@@ -304,14 +329,14 @@ class DataSet:
         """
         return 4 * 4096 // np.dtype(self.meta.raw_dtype).itemsize
 
-    def get_max_io_size(self) -> Optional[int]:
+    def get_max_io_size(self) -> int | None:
         """
         Override this method to implement a custom maximum I/O size (in bytes)
         """
         return None
 
     @property
-    def meta(self) -> Optional["DataSetMeta"]:
+    def meta(self) -> typing.Optional["DataSetMeta"]:
         return self._meta
 
     def get_task_comm_handler(self) -> "TaskCommHandler":

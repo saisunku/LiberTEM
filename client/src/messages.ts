@@ -14,6 +14,12 @@ export interface ResultFileFormat {
     description: string,
 }
 
+export interface ProgressDetails {
+    event: "start" | "update" | "end",
+    numFrames: number,
+    numFramesComplete: number,
+}
+
 export type JsonSchema = Record<string, unknown>;
 
 export interface DatasetTypeInfo {
@@ -68,7 +74,7 @@ export const ClusterTypeMetadata: { [s: string]: { [s: string]: string } } = {
 export interface ConnectRequestLocalCluster {
     type: ClusterTypes.LOCAL,
     numWorkers?: number,
-    cudas: number[],
+    cudas: Record<number, number>
 }
 
 export interface ConnectRequestTCP {
@@ -389,12 +395,12 @@ export type MsgPartInitialDataset = DatasetOpen
 // type alias to add client-side state to datasets (currently empty)
 export type DatasetState = Dataset
 
-export enum ShapeLengths {
-    NAV_SHAPE_MIN_LENGTH = 2,
-    NAV_SHAPE_MAX_LENGTH = 2,
-    SIG_SHAPE_MIN_LENGTH = 2,
-    SIG_SHAPE_MAX_LENGTH = 2
-}
+export const ShapeLengths = {
+    NAV_SHAPE_MIN_LENGTH: 2,
+    NAV_SHAPE_MAX_LENGTH: 2,
+    SIG_SHAPE_MIN_LENGTH: 2,
+    SIG_SHAPE_MAX_LENGTH: 2
+};
 
 /*
  * Job
@@ -709,6 +715,33 @@ export interface DirectoryListingResponseError {
 }
 
 export type DirectoryListingResponse = DirectoryListingResponseOK | DirectoryListingResponseError;
+
+
+export interface StatResponseOK {
+    status: "ok",
+    path: string,
+    dirname: string,
+    basename: string,
+    stat: {
+        size: number,
+        ctime: number,
+        mtime: number,
+        owner: string,
+        isdir: boolean,
+        isreg: boolean,
+    },
+}
+
+export interface StatResponseError {
+    status: "error",
+    path: string,
+    code: string,
+    msg: string,
+    alternative?: string,
+}
+
+export type StatResponse = StatResponseError | StatResponseOK;
+
 
 export interface ShutdownResponse {
     status: "ok",

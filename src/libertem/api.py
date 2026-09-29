@@ -1,26 +1,31 @@
 from typing import (
-    TYPE_CHECKING, Any, List, Optional, Union, Iterable, Generator, Coroutine,
-    AsyncGenerator, overload, Tuple
+    TYPE_CHECKING, Any, Union, overload, Optional
 )
-from typing_extensions import Literal
+from collections.abc import Iterable, Generator, Coroutine
+from typing import Literal
+import os
+import pathlib
 import warnings
 import weakref
 import atexit
+import logging
+import copy
 
 from opentelemetry import trace
 import numpy as np
 from libertem.executor.pipelined import PipelinedExecutor
 
 from libertem.io.corrections import CorrectionSet
+from libertem.executor.base import make_canonical
 from libertem.executor.concurrent import ConcurrentJobExecutor
 from libertem.executor.inline import InlineJobExecutor
 from libertem.io.dataset import load, filetypes
 from libertem.io.dataset.base import DataSet
 from libertem.common.buffers import BufferWrapper
-from libertem.executor.dask import DaskJobExecutor
+from libertem.executor.dask import DaskJobExecutor, cluster_spec
 from libertem.executor.delayed import DelayedJobExecutor
 from libertem.executor.integration import get_dask_integration_executor
-from libertem.common.executor import JobExecutor
+from libertem.common.executor import JobExecutor, GPUSpec
 from libertem.common.progress import ProgressReporter
 from libertem.masks import MaskFactoriesType
 from libertem.analysis.raw import PickFrameAnalysis
@@ -32,36 +37,141 @@ from libertem.analysis.sum import SumAnalysis
 from libertem.analysis.point import PointMaskAnalysis
 from libertem.analysis.masks import MasksAnalysis
 from libertem.analysis.base import AnalysisResultSet, Analysis
-from libertem.udf.base import UDFResultDict, UDF, UDFResults
+from libertem.udf.base import UDFResultDict, UDF, UDFResults, UDFRunner
 from libertem.udf.auto import AutoUDF
 from libertem.common.async_utils import async_generator, run_agen_get_last, run_gen_get_last
 from libertem.common.sparse import sparse_to_coo, to_dense
+from libertem.common.exceptions import ExecutorSpecException
 
 if TYPE_CHECKING:
     import numpy.typing as nt
     from sparse import SparseArray
     from scipy.sparse import spmatrix
+    from libertem.viz.base import Live2DPlot
 
 tracer = trace.get_tracer(__name__)
+logger = logging.getLogger(__name__)
 
 RunUDFResultType = UDFResultDict
-RunUDFSyncL = List[UDFResultDict]
+RunUDFSyncL = list[UDFResultDict]
 RunUDFAsync = Coroutine[None, None, UDFResultDict]
-RunUDFAsyncL = Coroutine[None, None, List[UDFResultDict]]
-RunUDFGenType = Generator[UDFResults, None, None]
-RunUDFGenTypeL = Generator[UDFResults, None, None]
-RunUDFAGenType = AsyncGenerator[UDFResults, None]
-RunUDFAGenTypeL = AsyncGenerator[UDFResults, None]
-ExecutorSpecType = Union[
-    Literal['synchronous'], Literal['inline'],
-    Literal['threads'],
-    Literal['dask-integration'],
-    Literal['dask-make-default'],
-    Literal['delayed'],
-    Literal['pipelined'],
+RunUDFAsyncL = Coroutine[None, None, list[UDFResultDict]]
+ExecutorSpecType = Literal[
+    'synchronous',
+    'inline',
+    'threads',
+    'dask',
+    'dask-integration',
+    'dask-make-default',
+    'delayed',
+    'pipelined',
 ]
-IterableRoiT = Iterable[Tuple[Tuple[int], bool]]
-RoiT = Optional[Union[np.ndarray, 'SparseArray', 'spmatrix', Tuple[int], IterableRoiT]]
+IterableRoiT = Iterable[tuple[tuple[int, ...], bool]]
+RoiT = Union[np.ndarray, 'SparseArray', 'spmatrix', tuple[int, ...], IterableRoiT] | None
+
+
+class ResultGenerator:
+    """
+    Yields partial results from one or more UDFs currently running,
+    with methods to control some aspects of the UDF run.
+    """
+
+    def __init__(
+        self,
+        task_results: Generator[UDFResults, None, None],
+        runner: UDFRunner,
+        result_iter,
+    ):
+        self._task_results = task_results
+        self._runner = runner
+        self._result_iter = result_iter
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._task_results)
+
+    def close(self):
+        self._task_results.close()
+        self._result_iter.close()
+
+    def update_parameters_experimental(self, parameters: list[dict[str, Any]]):
+        """
+        Update parameters while the UDFs are running.
+
+        :code:`parameters` should be a list of dicts, with one dict for each
+        UDF you are running.
+
+        The dicts should only contain items for those parameters you want to
+        update.
+        """
+        logger.debug("ResultGenerator.update_parameters_experimental: %s", parameters)
+        self._result_iter.update_parameters_experimental(parameters)
+
+    def throw(self, exc: Exception):
+        return self._result_iter.throw(exc)
+
+
+class ResultAsyncGenerator:
+    """
+    async wrapper of `ResultGenerator`.
+    """
+
+    def __init__(self, result_generator: ResultGenerator):
+        from concurrent.futures import ThreadPoolExecutor
+        self._result_generator = result_generator
+        self._pool = ThreadPoolExecutor(max_workers=1)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        from .common.async_utils import MyStopIteration
+        try:
+            return await self._run_in_executor(self._inner_next)
+        except MyStopIteration:
+            raise StopAsyncIteration()
+
+    def _inner_next(self):
+        from .common.async_utils import MyStopIteration
+        try:
+            return next(self._result_generator)
+        except StopIteration:
+            raise MyStopIteration()
+
+    async def aclose(self):
+        return await self._run_in_executor(self._result_generator.close)
+
+    async def _run_in_executor(self, f, *args):
+        import asyncio
+        loop = asyncio.get_event_loop()
+        next_result = await loop.run_in_executor(self._pool, f, *args)
+        return next_result
+
+    async def update_parameters_experimental(self, parameters: list[dict[str, Any]]):
+        """
+        Update parameters while the UDFs are running.
+
+        :code:`parameters` should be a list of dicts, with one dict for each
+        UDF you are running.
+
+        The dicts should only contain items for those parameters you want to
+        update.
+        """
+        logger.debug("ResultGenerator.update_parameters_experimental: %s", parameters)
+        return await self._run_in_executor(
+            self._result_generator.update_parameters_experimental, parameters
+        )
+
+    async def athrow(self, exc: Exception):
+        return await self._run_in_executor(self._result_generator.throw, exc)
+
+
+RunUDFGenType = ResultGenerator
+RunUDFGenTypeL = ResultGenerator
+RunUDFAGenType = ResultAsyncGenerator
+RunUDFAGenTypeL = ResultAsyncGenerator
 
 
 class Context:
@@ -106,31 +216,59 @@ class Context:
     >>> ctx = libertem.api.Context()  # doctest: +SKIP
 
     >>> # Create a Context using an inline executor for debugging
+    >>> # See also Context.make_with() for a more convenient interface!
     >>> from libertem.executor.inline import InlineJobExecutor
     >>> debug_ctx = libertem.api.Context(executor=InlineJobExecutor())
     """
 
-    def __init__(self, executor: Optional[JobExecutor] = None, plot_class=None):
+    def __init__(
+        self,
+        executor: JobExecutor | None = None,
+        plot_class: Optional['Live2DPlot'] = None,
+    ):
+        import traceback
         if executor is None:
             executor = self._create_local_executor()
         self.executor = executor
         self._plot_class = plot_class
+        self._created_at = traceback.format_stack()
         self._register_at_exit()
 
     @classmethod
-    def make_with(cls, executor_spec: ExecutorSpecType, *args, **kwargs) -> 'Context':
+    def make_with(
+        cls,
+        executor_spec: ExecutorSpecType = 'dask',
+        *,
+        cpus: int | Iterable[int] | None = None,
+        gpus: int | Iterable[int] | None = None,
+        plot_class: Optional['Live2DPlot'] = None,
+        snooze_timeout: float | None = None,
+        main_process_gpu: GPUSpec = None,
+    ) -> 'Context':
         '''
         Create a Context with a specific kind of executor.
 
         .. versionadded:: 0.9.0
 
         This simplifies creating a :class:`Context` for a number of common executor
-        choices. See :ref:`executors` for general information on executors.
+        choices and allows specification of the resources used to create the executor.
+        For more fine-grained control of resource allocation create the
+        executor manually and pass it to the :class:`Context`.
+
+        See :ref:`executors` for general information on executors.
+
+        .. versionchanged:: 0.12.0
+
+            Prior to version 0.12.0, this function accepted :code:`*args, **kwargs`
+            and passed them to the initializer of :class:`Context`. Given that the
+            Context accepts only the :code:`plot_class` keyword-argument this was
+            hard-coded into this function for backwards-compatibility, enabling
+            the addition of the :code:`cpus` and :code:`gpus` parameters.
 
         Parameters
         ----------
 
-        executor_spec:
+        executor_spec : ExecutorSpecType, optional, by default "dask"
             A string identifier for executor variants:
 
             "synchronous", "inline":
@@ -138,15 +276,19 @@ class Context:
                 :class:`~libertem.executor.inline.InlineJobExecutor`
             "threads":
                 Use a multi-threaded :class:`~libertem.executor.concurrent.ConcurrentJobExecutor`
+            "dask":
+                Create a standard :class:`~libertem.executor.dask.DaskJobExecutor` without
+                considering any pre-existing Dask schedulers available on the system, similar to
+                the default behaviour of :code:`Context()` called with no arguments. Will create
+                by default 1 worker per-CPU core and per-GPU detected on the system.
             "dask-integration":
                 Use a JobExecutor that is compatible with the currently active Dask scheduler.
                 See :func:`~libertem.executor.integration.get_dask_integration_executor` for
                 more information.
             "dask-make-default":
                 Create a local :code:`dask.distributed` cluster and client
-                using :meth:`~libertem.executor.dask.DaskJobExecutor.make_local`, similar to
-                the default behaviour of :code:`Context()` called with no arguments.
-                However, the Client will be set as the default Dask scheduler and will
+                using :meth:`~libertem.executor.dask.DaskJobExecutor.make_local`.
+                The Client will be set as the default Dask scheduler and will
                 persist after the LiberTEM Context closes, which is suitable for downstream
                 computation using :code:`dask.distributed`.
             "delayed":
@@ -157,44 +299,148 @@ class Context:
             "pipelined":
                 Create a :class:`~libertem.executor.pipelined.PipelinedExecutor`,
                 which is suitable for multi-process streaming live processing
-                using `LiberTEM-live <https://libertem.github.io/LiberTEM-live/>`_.
-        *args, **kwargs
-            Passed to :class:`Context`.
+                using `LiberTEM-live <https://libertem.github.io/LiberTEM-live/>`_
+        cpus : int | Iterable[int], optional
+            The number of CPU workers to create, where possible. The meaning of
+            CPU worker depends on the type of executor created - threaded executors
+            will interpret :code:`cpus` to choose the number of threads, while process-based
+            executors will interpret the value to choose the number of processes to spawn.
+            The iterable form of of the argument is intended contain CPU-id values to
+            enable cpu-pinning where the exector and the system support it, but most
+            use cases will only require an integer argument. Executors where this
+            parameter does not make sense will raise an error if provided.
+            When unspecified the default executor behaviour is retained.
+        gpus : int | Iterable[int], optional
+            Similar to :code:`cpus`, specifies the number of GPU workers to create
+            where the executor chosen supports it, else raise an error. The integer
+            form of the argument specifies the total number of workers to create,
+            assigned according to the implementation of each executor, while
+            the iterable form allows assigment of multiple workers to specific GPUs
+            by repeating the id of any given GPU in the argument.
+            When unspecified the default executor behaviour is retained.
+        plot_class : libertem.viz.base.Live2DPlot, optional
+            Plot class for live plotting, passed to :class:`Context`.
+        snooze_timeout : float, optional
+            Activate automatic executor downscaling after :code:`snooze_timeout`
+            minutes of inactivity. This can be used to free resources in a shared
+            environment, for example. The executor is automatically brought back
+            up when used again after snoozing. Currently only supported for the
+            :class:`~libertem.executor.dask.DaskJobExecutor`.
+        main_process_gpu : int or bool, optional
+
+            .. versionadded:: 0.16.0
+
+            Activate GPU processing on the main process. Currently, this switches
+            :attr:`libertem.udf.base.UDF.xp` to CuPy if available.
+
+            True:
+                Use any available GPU, throw an error if none are available.
+            int:
+                Specify GPU ID to use, throw an error if it is not present.
+            False:
+                Don't use GPU on the main process.
+            None:
+                Default behavior. Currently activates GPU processing if a GPU is
+                available to catch any potential issues with this feature.
+
+        Raises
+        ------
+        libertem.common.exceptions.ExecutorSpecException :
+            for invalid executor choice or unsupported worker specifications
 
         Returns
         -------
         Instance of :class:`Context` using a new instance of the specified executor.
         '''
+        # The following block is temporary until the handling of cpus/gpus args is
+        # pushed onto each exector
+        cpu_spec = cpus is not None
+        gpu_spec = gpus is not None
+        has_spec = cpu_spec or gpu_spec
+        limited_execs = ('inline', 'synchronous', 'dask-integration', 'delayed')
+        cannot_cpus = executor_spec in limited_execs
+        if cpu_spec and cannot_cpus:
+            raise ExecutorSpecException(f'Executor type {executor_spec} does not support '
+                                        'specifying CPU workers at this time')
+        cannot_gpus = executor_spec in limited_execs + ('threads',)
+        if gpu_spec and cannot_gpus:
+            raise ExecutorSpecException(f'Executor type {executor_spec} does not support '
+                                        'specifying GPU workers at this time')
+        # Delay import here to avoid cupy import overhead
+        if has_spec and executor_spec in ('dask', 'dask-make-default', 'pipelined'):
+            from libertem.utils.devices import detect
+            spec_args = detect()
+            if cpu_spec:
+                spec_args['cpus'] = cpus
+            if gpu_spec:
+                if len(spec_args['cudas']) == 0 and gpus:
+                    raise ExecutorSpecException('Cannot specify GPU workers as no GPUs detected')
+                spec_args['cudas'] = gpus
+        spec = None
+        if has_spec and executor_spec in ('dask', 'dask-make-default'):
+            spec = cluster_spec(**spec_args)
+
+        if snooze_timeout is not None:
+            snooze_timeout *= 60
+
         executor: JobExecutor
         if executor_spec in ('synchronous', 'inline'):
-            executor = InlineJobExecutor()
-        elif executor_spec == 'threads':
-            executor = ConcurrentJobExecutor.make_local()
-        elif executor_spec == 'dask-integration':
-            executor = get_dask_integration_executor()
-        elif executor_spec == 'dask-make-default':
-            executor = DaskJobExecutor.make_local(client_kwargs={"set_as_default": True})
-        elif executor_spec == 'delayed':
-            executor = DelayedJobExecutor()
-        elif executor_spec == 'pipelined':
-            executor = PipelinedExecutor()
-        else:
-            raise ValueError(
-                f'Argument `executor_spec` is {executor_spec}. Allowed are '
-                f'synchronous", "inline", "threads", "dask-integration", '
-                f'"dask-make-default" or "pipelined".'
+            executor = InlineJobExecutor(
+                main_process_gpu=make_canonical(main_process_gpu)
             )
-        return cls(executor=executor, *args, **kwargs)
+        elif executor_spec == 'threads':
+            n_threads = cpus
+            try:
+                n_threads = len(n_threads)
+            except TypeError:
+                pass
+            executor = ConcurrentJobExecutor.make_local(
+                n_threads=n_threads,
+                main_process_gpu=main_process_gpu
+            )
+        elif executor_spec == 'dask':
+            executor = DaskJobExecutor.make_local(
+                spec=spec,
+                snooze_timeout=snooze_timeout,
+                main_process_gpu=main_process_gpu
+            )
+        elif executor_spec == 'dask-integration':
+            executor = get_dask_integration_executor(main_process_gpu=main_process_gpu)
+        elif executor_spec == 'dask-make-default':
+            executor = DaskJobExecutor.make_local(
+                spec=spec,
+                client_kwargs={"set_as_default": True},
+                main_process_gpu=main_process_gpu,
+            )
+        elif executor_spec == 'delayed':
+            executor = DelayedJobExecutor(
+                main_process_gpu=make_canonical(main_process_gpu)
+            )
+        elif executor_spec == 'pipelined':
+            if has_spec:
+                spec = PipelinedExecutor.make_spec(**spec_args)
+                executor = PipelinedExecutor(
+                    spec=spec, main_process_gpu=make_canonical(main_process_gpu)
+                )
+            else:
+                executor = PipelinedExecutor.make_local(main_process_gpu=main_process_gpu)
+        else:
+            raise ExecutorSpecException(
+                f'Argument `executor_spec` is {executor_spec}. Allowed are '
+                f'"synchronous", "inline", "threads", "dask", "dask-integration",'
+                f'"dask-make-default" "delayed" or "pipelined".'
+            )
+        return cls(executor=executor, plot_class=plot_class)
 
     @property
-    def plot_class(self):
+    def plot_class(self) -> type['Live2DPlot']:
         if self._plot_class is None:
             from libertem.viz.mpl import MPLLive2DPlot
             self._plot_class = MPLLive2DPlot
         return self._plot_class
 
     @plot_class.setter
-    def plot_class(self, value):
+    def plot_class(self, value: type['Live2DPlot']):
         self._plot_class = value
 
     def load(self, filetype: str, *args, io_backend=None, **kwargs) -> DataSet:
@@ -608,9 +854,9 @@ class Context:
     def run(
         self, job: Analysis,
         roi: RoiT = None,
-        progress: Union[bool, ProgressReporter] = False,
-        corrections: Optional[CorrectionSet] = None,
-    ) -> Union[np.ndarray, AnalysisResultSet]:
+        progress: bool | ProgressReporter = False,
+        corrections: CorrectionSet | None = None,
+    ) -> np.ndarray | AnalysisResultSet:
         """
         Run the given :class:`~libertem.analysis.base.Analysis`
         and return the result data.
@@ -668,14 +914,14 @@ class Context:
     def run_udf(
         self,
         dataset: DataSet,
-        udf: Union[UDF, Iterable[UDF]],
+        udf: UDF | Iterable[UDF],
         roi: RoiT = None,
-        corrections: Optional[CorrectionSet] = None,
-        progress: Union[bool, ProgressReporter] = False,
+        corrections: CorrectionSet | None = None,
+        progress: bool | ProgressReporter = False,
         backends=None,
         plots=None,
         sync=True,
-    ) -> Union[RunUDFResultType, RunUDFSyncL, RunUDFAsync, RunUDFAsyncL]:
+    ) -> RunUDFResultType | RunUDFSyncL | RunUDFAsync | RunUDFAsyncL:
         """
         Run :code:`udf` on :code:`dataset`, restricted to the region of interest :code:`roi`.
 
@@ -688,6 +934,12 @@ class Context:
         .. versionchanged:: 0.7.0
             Added the :code:`plots` and :code:`sync` parameters,
             and the ability to run multiple UDFs on the same data in a single pass.
+
+        Raises
+        ------
+        UDFRunCancelled
+            Either the run was cancelled using :meth:`AsyncJobExecutor.cancel`,
+            or the underlying data source was interrupted.
 
         Parameters
         ----------
@@ -734,7 +986,7 @@ class Context:
 
         Returns
         -------
-        dict or Tuple[dict]
+        dict or Tuple[dict, ...]
             Return value of the UDF containing the result buffers of
             type :class:`libertem.common.buffers.BufferWrapper`. Note that a
             :class:`~libertem.common.buffers.BufferWrapper` can be used like
@@ -743,7 +995,7 @@ class Context:
             :attr:`~libertem.common.buffers.BufferWrapper.data` property.
 
             If a list of UDFs was passed in, the returned type is
-            a Tuple[dict[str,BufferWrapper]].
+            a Tuple[dict[str,BufferWrapper], ...].
 
         Examples
         --------
@@ -758,8 +1010,7 @@ class Context:
         Running a UDF on a subset of data:
 
         >>> from libertem.udf.sumsigudf import SumSigUDF
-        >>> roi = np.zeros(dataset.shape.nav, dtype=bool)
-        >>> roi[0, 0] = True
+        >>> roi = dataset.roi[0, 0]
         >>> result = ctx.run_udf(dataset=dataset, udf=SumSigUDF(), roi=roi)
         >>> # to get the full navigation-shaped results, with NaNs where the `roi` was False:
         >>> np.array(result["intensity"]).shape
@@ -802,14 +1053,14 @@ class Context:
     def run_udf_iter(
         self,
         dataset: DataSet,
-        udf: Union[UDF, Iterable[UDF]],
+        udf: UDF | Iterable[UDF],
         roi: RoiT = None,
         corrections: CorrectionSet = None,
-        progress: Union[bool, ProgressReporter] = False,
+        progress: bool | ProgressReporter = False,
         backends=None,
         plots=None,
         sync=True,
-    ) -> Union[RunUDFGenType, RunUDFAGenType, RunUDFGenTypeL, RunUDFAGenTypeL]:
+    ) -> RunUDFGenType | RunUDFAGenType | RunUDFGenTypeL | RunUDFAGenTypeL:
         """
         Run :code:`udf` on :code:`dataset`, restricted to the region of interest :code:`roi`.
         Yields partial results after each merge operation.
@@ -904,10 +1155,10 @@ class Context:
         dataset: DataSet,
         udf: UDF,
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
-        backends: Optional[Any],
-        plots: Optional[Any],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
+        backends: Any | None,
+        plots: Any | None,
         iterate: Literal[False],
     ) -> UDFResultDict:
         ...
@@ -918,10 +1169,10 @@ class Context:
         dataset: DataSet,
         udf: UDF,
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
-        backends: Optional[Any],
-        plots: Optional[Any],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
+        backends: Any | None,
+        plots: Any | None,
         iterate: Literal[True],
     ) -> RunUDFGenType: ...
 
@@ -931,10 +1182,10 @@ class Context:
         dataset: DataSet,
         udf: Iterable[UDF],
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
-        backends: Optional[Any],
-        plots: Optional[Any],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
+        backends: Any | None,
+        plots: Any | None,
         iterate: Literal[False],
     ) -> RunUDFSyncL: ...
 
@@ -944,10 +1195,10 @@ class Context:
         dataset: DataSet,
         udf: Iterable[UDF],
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
-        backends: Optional[Any],
-        plots: Optional[Any],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
+        backends: Any | None,
+        plots: Any | None,
         iterate: Literal[True],
     ) -> RunUDFGenTypeL: ...
 
@@ -955,53 +1206,54 @@ class Context:
     def _run_sync(
         self,
         dataset: DataSet,
-        udf: Union[Iterable[UDF], UDF],
+        udf: Iterable[UDF] | UDF,
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
-        backends: Optional[Any],
-        plots: Optional[Any],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
+        backends: Any | None,
+        plots: Any | None,
         iterate: Literal[True],
-    ) -> Union[RunUDFGenType, RunUDFGenTypeL]:
+    ) -> RunUDFGenType | RunUDFGenTypeL:
         ...
 
     @overload
     def _run_sync(
         self,
         dataset: DataSet,
-        udf: Union[Iterable[UDF], UDF],
+        udf: Iterable[UDF] | UDF,
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
-        backends: Optional[Any],
-        plots: Optional[Any],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
+        backends: Any | None,
+        plots: Any | None,
         iterate: Literal[False],
-    ) -> Union[UDFResultDict, RunUDFSyncL]:
+    ) -> UDFResultDict | RunUDFSyncL:
         ...
 
     @overload
     def _run_sync(
         self,
         dataset: DataSet,
-        udf: Union[Iterable[UDF], UDF],
+        udf: Iterable[UDF] | UDF,
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
-        backends: Optional[Any],
-        plots: Optional[Any],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
+        backends: Any | None,
+        plots: Any | None,
         iterate: bool,
-    ) -> Union[UDFResultDict, RunUDFSyncL, RunUDFGenType, RunUDFGenTypeL]: ...
+    ) -> UDFResultDict | RunUDFSyncL | RunUDFGenType | RunUDFGenTypeL: ...
 
     def _run_sync(
         self,
         dataset: DataSet,
-        udf: Union[UDF, Iterable[UDF]],
+        udf: UDF | Iterable[UDF],
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
         backends,
         plots,
         iterate: bool,
+        copy_needed: bool = False,
     ):
         """
         Run the given UDF(s), either returning the final result (when
@@ -1010,7 +1262,7 @@ class Context:
         enable_plotting = bool(plots)
 
         udf_is_list = isinstance(udf, Iterable)
-        if not udf_is_list:
+        if not isinstance(udf, Iterable):  # duplicate, because mypy.
             udfs = [udf]
         else:
             udfs = list(udf)
@@ -1026,41 +1278,51 @@ class Context:
             corrections = dataset.get_correction_data()
 
         if roi is not None:
+            # if the user modifies the ROI object after running,
+            # we must make sure we take a copy here so we don't
+            # share with other references to the `roi`:
+            roi = copy.deepcopy(roi)
             roi = sparse_to_coo(roi, dataset.shape.nav)
             if roi.dtype is not np.dtype(bool):
                 warnings.warn(f"ROI dtype is {roi.dtype}, expected bool. Attempting cast to bool.")
                 roi = roi.astype(bool)
 
+        progress_reporter: ProgressReporter | None
         if isinstance(progress, ProgressReporter):
             progress_reporter = progress
             progress = True
         else:
             progress_reporter = None
 
-        def _run_sync_wrap() -> Generator[UDFResults, None, None]:
+        def _run_sync_wrap() -> ResultGenerator:
             runner_cls = self.executor.get_udf_runner()
-            result_iter = runner_cls(
+            runner = runner_cls(
                 udfs,
                 progress_reporter=progress_reporter,
-            ).run_for_dataset_sync(
+            )
+            result_iter = runner.run_for_dataset_sync(
                 dataset=dataset,
                 executor=self.executor,
                 roi=roi,
                 progress=progress,
                 corrections=corrections,
                 backends=backends,
-                iterate=(iterate or enable_plotting)
+                iterate=(iterate or enable_plotting),
+                copy_needed=iterate and copy_needed,
             )
-            for udf_results in result_iter:
-                yield udf_results
+
+            def _inner():
+                for udf_results in result_iter:
+                    yield udf_results
+                    if enable_plotting:
+                        self._update_plots(
+                            plots, udfs, udf_results.buffers, udf_results.damage.data, force=False
+                        )
                 if enable_plotting:
                     self._update_plots(
-                        plots, udfs, udf_results.buffers, udf_results.damage.data, force=False
+                        plots, udfs, udf_results.buffers, udf_results.damage.data, force=True
                     )
-            if enable_plotting:
-                self._update_plots(
-                    plots, udfs, udf_results.buffers, udf_results.damage.data, force=True
-                )
+            return ResultGenerator(_inner(), runner=runner, result_iter=result_iter)
 
         if iterate:
             return _run_sync_wrap()
@@ -1077,8 +1339,8 @@ class Context:
         dataset: DataSet,
         udf: UDF,
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
         backends,
         plots,
         iterate: Literal[False],
@@ -1090,8 +1352,8 @@ class Context:
         dataset: DataSet,
         udf: Iterable[UDF],
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
         backends,
         plots,
         iterate: Literal[False],
@@ -1103,8 +1365,8 @@ class Context:
         dataset: DataSet,
         udf: UDF,
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
         backends,
         plots,
         iterate: Literal[True],
@@ -1116,8 +1378,8 @@ class Context:
         dataset: DataSet,
         udf: Iterable[UDF],
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
         backends,
         plots,
         iterate: Literal[True],
@@ -1127,48 +1389,48 @@ class Context:
     def _run_async(
         self,
         dataset: DataSet,
-        udf: Union[UDF, Iterable[UDF]],
+        udf: UDF | Iterable[UDF],
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
         backends,
         plots,
         iterate: Literal[True],
-    ) -> Union[RunUDFAGenTypeL, RunUDFAGenType]: ...
+    ) -> RunUDFAGenTypeL | RunUDFAGenType: ...
 
     @overload
     def _run_async(
         self,
         dataset: DataSet,
-        udf: Union[UDF, Iterable[UDF]],
+        udf: UDF | Iterable[UDF],
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
         backends,
         plots,
         iterate: Literal[False],
-    ) -> Union[RunUDFAsync, RunUDFAsyncL]: ...
+    ) -> RunUDFAsync | RunUDFAsyncL: ...
 
     @overload
     def _run_async(
         self,
         dataset: DataSet,
-        udf: Union[Iterable[UDF], UDF],
+        udf: Iterable[UDF] | UDF,
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
         backends,
         plots,
         iterate: bool,
-    ) -> Union[RunUDFAsync, RunUDFAsyncL, RunUDFAGenType, RunUDFAGenTypeL]: ...
+    ) -> RunUDFAsync | RunUDFAsyncL | RunUDFAGenType | RunUDFAGenTypeL: ...
 
     def _run_async(
         self,
         dataset: DataSet,
-        udf: Union[UDF, Iterable[UDF]],
+        udf: UDF | Iterable[UDF],
         roi: RoiT,
-        corrections: Optional[CorrectionSet],
-        progress: Union[bool, ProgressReporter],
+        corrections: CorrectionSet | None,
+        progress: bool | ProgressReporter,
         backends,
         plots,
         iterate: bool,
@@ -1186,19 +1448,19 @@ class Context:
             backends=backends,
             plots=plots,
             iterate=True,
+            copy_needed=True,
         )
-        udfres_iter = async_generator(sync_generator)
 
         async def _run_async_wrap() -> UDFResultDict:
-            udf_results = await run_agen_get_last(udfres_iter)
+            udf_results = await run_agen_get_last(async_generator(sync_generator))
             return udf_results.buffers[0]
 
-        async def _run_async_wrap_l() -> List[UDFResultDict]:
-            udf_results = await run_agen_get_last(udfres_iter)
+        async def _run_async_wrap_l() -> list[UDFResultDict]:
+            udf_results = await run_agen_get_last(async_generator(sync_generator))
             return udf_results.buffers
 
         if iterate:
-            return udfres_iter
+            return ResultAsyncGenerator(result_generator=sync_generator)
         else:
             if isinstance(udf, Iterable):
                 return _run_async_wrap_l()
@@ -1212,7 +1474,13 @@ class Context:
             for bufferset in buffers
         ]
 
-    def _prepare_plots(self, udfs, dataset, roi, plots):
+    def _prepare_plots(
+        self,
+        udfs: list[UDF],
+        dataset: DataSet,
+        roi: RoiT,
+        plots,
+    ) -> list['Live2DPlot']:
         runner_cls = self.executor.get_udf_runner()
         dry_results = runner_cls.dry_run(udfs, dataset, roi)
 
@@ -1259,7 +1527,14 @@ class Context:
                 plots.append(p0)
         return plots
 
-    def _update_plots(self, plots, udfs, udf_results, damage, force=False):
+    def _update_plots(
+        self,
+        plots: list['Live2DPlot'],
+        udfs: list[UDF],
+        udf_results: tuple[dict[str, BufferWrapper], ...],
+        damage: np.ndarray,
+        force: bool = False,
+    ):
         for plot in plots:
             udf = plot.get_udf()
             udf_index = udfs.index(udf)
@@ -1340,7 +1615,7 @@ class Context:
         )
 
     def map(self, dataset: DataSet, f, roi: RoiT = None,
-            progress: Union[bool, ProgressReporter] = False,
+            progress: bool | ProgressReporter = False,
             corrections: CorrectionSet = None,
             backends=None) -> BufferWrapper:
         '''
@@ -1415,6 +1690,79 @@ class Context:
         def _exit():
             if weak_ctx() is None:
                 return
-            weak_ctx().close()
+            try:
+                weak_ctx().close()
+            except Exception:  # pragma: no cover
+                # can't be sure that logging is still alive,
+                # so we have to fall back to a normal print here:
+                print("\n\n\n\n\n")
+                print("Exception in atexit handler for Context created here:")
+                print("".join(weak_ctx()._created_at))
+                print("\n\n\n\n\n")
+                raise
 
         atexit.register(_exit)
+
+    def export_dataset(
+        self,
+        dataset: DataSet,
+        *,
+        path: os.PathLike,
+        progress: bool = False,
+        overwrite: bool = False,
+    ):
+        """
+        Export the dataset to another format on disk
+
+        At this time can only convert to numpy *.npy* format,
+        but future extensions are possible.
+
+        The written data will have any reshaping / sync_offset
+        properties of the DataSet effectively baked into
+        the new file.
+
+        .. note::
+            All workers used by the Context must have access to the
+            same file path, over a network file system if necessary,
+            in order to correctly save data to the file.
+
+        .. versionadded:: 0.12.0
+
+        Parameters
+        ----------
+        dataset : lt.Dataset
+            The dataset to save to disk
+        path : os.PathLike
+            The file path to export the data to, will
+            raise ValueError if the suffix is unrecognized
+            (currently supports only .npy)
+        progress : bool, optional
+            Whether to display a progress bar for the export,
+            by default False
+        overwrite : bool , optional
+            If the save path already exists, raise FileExistsError unless
+            overwrite is True, by default False
+
+        Raises
+        ------
+        ValueError
+            If the path suffix is not supported
+        FileExistsError
+            If overwrite is True and the save path exists
+        """
+        path = pathlib.Path(path)
+        if path.suffix != '.npy':
+            raise ValueError(
+                f'Unrecognized file extension {path.suffix} '
+                'only .npy is currently supported.'
+            )
+
+        if not overwrite and path.is_file():
+            raise FileExistsError(
+                f'Cannot export dataset to existing path {path} .'
+                'Use overwrite=True to force export.'
+            )
+
+        from libertem.udf.record import RecordUDF
+        udf = RecordUDF(path)
+        self.run_udf(dataset, udf, progress=progress)

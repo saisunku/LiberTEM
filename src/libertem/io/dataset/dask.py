@@ -125,11 +125,10 @@ class DaskDataSet(DataSet):
     Example
     --------
 
-    >>> from libertem.io.dataset.dask import DaskDataSet
     >>> import dask.array as da
     >>>
-    >>> d_arr = da.ones((10, 100, 256, 256), chunks=(2, -1, -1, -1))
-    >>> ds = DaskDataSet(d_arr, sig_dims=2)
+    >>> d_arr = da.ones((4, 4, 64, 64), chunks=(2, -1, -1, -1))
+    >>> ds = ctx.load('dask', dask_array=d_arr, sig_dims=2)
 
     Will create a dataset with 5 partitions split along the zeroth dimension.
     """
@@ -506,7 +505,7 @@ def merge_until_target(array, target, min_chunks=0):
     chunksizes = get_chunksizes(array)
     while chunksizes.size > min_chunks and chunksizes.min() < target:
         if (chunksizes < 0).any():
-            log.warn('Overflow in chunksize calculation, will be clipped!')
+            log.warning('Overflow in chunksize calculation, will be clipped!')
         chunksizes = np.clip(chunksizes, 0., np.inf)
         last_chunked_dim = get_last_chunked_dim(chunking)
         if last_chunked_dim < 0:

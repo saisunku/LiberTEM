@@ -53,13 +53,23 @@ C-ordered `.dm4` nD-dataset, and :class:`~libertem.io.dataset.dm.StackedDMDataSe
 for a stack of individual `.dm3` or `.dm4` image files which altogether
 comprise a nD-dataset.
 
-Both forms can be created using :code:`ctx.load('dm', ...)`,
+Both forms can be created using the following call to the :code:`Context`:
+
+.. code-block::
+
+   ctx.load('dm', ...)
+
+
 and where possible the choice of reader (single-file or stacked) will
 be inferred from the parameters.
 
 .. autoclass:: libertem.io.dataset.dm_single.SingleDMDataSet
 
 .. autoclass:: libertem.io.dataset.dm.StackedDMDataSet
+
+DM4 datsets stored in a transposed format :code:`(sig, nav)` can
+be converted to C-ordered data compatible with LiberTEM using the contrib function
+:meth:`~libertem.contrib.convert_transposed.convert_dm4_transposed`.
 
 .. _`empad`:
 
@@ -137,6 +147,11 @@ Dask
 ~~~~
 
 .. autoclass:: libertem.io.dataset.dask.DaskDataSet
+
+Converters
+----------
+
+.. autofunction:: libertem.contrib.convert_transposed.convert_dm4_transposed
 
 Internal DataSet API
 --------------------

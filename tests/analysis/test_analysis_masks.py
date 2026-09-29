@@ -1,4 +1,5 @@
 import pytest
+from collections.abc import Sequence
 import numpy as np
 import scipy.sparse as sp
 import sparse
@@ -8,6 +9,7 @@ from sparseconverter import (
 
 from utils import _naive_mask_apply, _mk_random, set_device_class
 
+from libertem.masks import circular
 from libertem.common.sparse import to_dense, to_sparse, is_sparse
 from libertem.common import Shape, Slice
 from libertem.io.dataset.memory import MemoryDataSet
@@ -396,6 +398,37 @@ def test_multi_mask_stack_force_sparse_pydata(lt_ctx, backend):
         )
         analysis = lt_ctx.create_mask_analysis(
             dataset=dataset, factories=lambda: masks, use_sparse='sparse.pydata', mask_count=2
+        )
+        if backend in CUPY_BACKENDS:
+            with pytest.raises(ValueError):
+                results = lt_ctx.run(analysis)
+        else:
+            results = lt_ctx.run(analysis)
+            assert np.allclose(
+                results.mask_0.raw_data,
+                expected[0],
+            )
+            assert np.allclose(
+                results.mask_1.raw_data,
+                expected[1],
+            )
+
+
+@pytest.mark.parametrize(
+    'backend', (None, ) + tuple(ApplyMasksUDF(lambda x: None).get_backends())
+)
+def test_multi_mask_stack_force_sparse_pydata_GCXS(lt_ctx, backend):
+    with set_device_class(get_device_class(backend)):
+        data = _mk_random(size=(16, 16, 16, 16), dtype="<u2")
+        masks = _mk_random(size=(2, 16, 16))
+        expected = _naive_mask_apply(masks, data)
+
+        dataset = MemoryDataSet(
+            data=data, tileshape=(4 * 4, 4, 4), num_partitions=2,
+            array_backends=(backend, ) if backend is not None else None
+        )
+        analysis = lt_ctx.create_mask_analysis(
+            dataset=dataset, factories=lambda: masks, use_sparse='sparse.pydata.GCXS', mask_count=2
         )
         if backend in CUPY_BACKENDS:
             with pytest.raises(ValueError):
@@ -943,3 +976,289 @@ def test_numerics_succeed(lt_ctx):
 
     assert np.allclose(expected, naive)
     assert np.allclose(expected[0], results.mask_0.raw_data)
+
+
+@pytest.mark.parametrize(
+    'kwargs', (
+        {},
+        {'use_sparse': True},
+        {'use_sparse': False},
+        {'use_sparse': 'sparse.pydata'},
+        {'use_torch': True},
+    )
+)
+@pytest.mark.parametrize(
+    'backend', (None, NUMPY, CUPY)
+)
+def test_shifted_masks_constant_shifts(lt_ctx, kwargs, backend):
+    with set_device_class(get_device_class(backend)):
+        data = _mk_random(size=(16, 16, 16, 16), dtype="<u2")
+        mask0 = _mk_random(size=(16, 16))
+        mask1 = sp.csr_matrix(_mk_random(size=(16, 16)))
+        mask2 = sparse.COO.from_numpy(_mk_random(size=(16, 16)))
+        # The ApplyMasksUDF returns data with shape ds.shape.nav + (mask_count, ),
+        expected = np.moveaxis(_naive_mask_apply(
+            [mask0[0:15, 2:16], mask1[0:15, 2:16], mask2[0:15, 2:16]],
+            data[..., 1:16, 0:14]
+        ), (0, 1), (2, 0))
+
+        dataset = MemoryDataSet(data=data, num_partitions=2)
+        udf = ApplyMasksUDF(
+            mask_factories=[lambda: mask0, lambda: mask1, lambda: mask2],
+            shifts=np.round((1.1, -1.7)),
+            **kwargs
+        )
+        if backend == CUPY and kwargs.get('use_sparse', False) in (True, 'sparse.pydata'):
+            with pytest.raises(ValueError):
+                # Implement like this so we can test the implementation
+                # once CUPY + sparse.pydata is actually supported
+                results = lt_ctx.run_udf(udf=udf, dataset=dataset)
+            pytest.xfail('CuPy + sparse.pydata not yet supported')
+        else:
+            results = lt_ctx.run_udf(udf=udf, dataset=dataset)
+
+        assert np.allclose(results['intensity'].data, expected)
+
+
+def test_shifted_masks_scipy_sparse_raises(lt_ctx):
+    with pytest.raises(ValueError):
+        ApplyMasksUDF(
+            mask_factories=lambda: np.ones((5, 6)),
+            shifts=(1.2, -3.1),
+            use_sparse='scipy.sparse',
+        )
+
+
+def _make_lambda(mask):
+    return lambda: mask
+
+
+def naive_shifted_mask_apply(
+    masks: Sequence[np.ndarray],
+    data: np.ndarray,
+    shifts: np.ndarray,
+) -> np.ndarray:
+    """
+    Manually compute the intersection of masks with data when
+    shifts are applied, and return the dot product between them
+    as an array of shape (num_frames, num_masks)
+
+    Inputs must all be array-like with shapes
+        masks: np.array(num_masks, h, w) or [num_masks * np.array(h, w)]
+        data: (num_frames, h, w)
+        shifts: (2,) or (num_frames, 2) of (y/x shifts of the mask)
+    Sparse input masks or data are densified
+    If shifts has shape (2,) then the same shift is applied to all frames/masks
+    A zero-overlap between mask and frame returns zero
+    for the dot product for that pair
+    """
+    # Densify inputs just in case!
+    data = to_dense(data)
+    masks = np.asarray([to_dense(m) for m in masks])
+    num_frames, h, w = data.shape
+    num_masks, mh, mw = masks.shape
+    assert h == mh
+    assert w == mw
+
+    # Ensure we have one shift pair per frame even if constant shift
+    if shifts.shape == (2,):
+        shifts = np.repeat(shifts[np.newaxis, ...], num_frames, axis=0)
+    assert shifts.shape == (num_frames, 2)
+
+    expected = np.zeros((num_frames, num_masks), dtype=np.float64)
+    for frame_idx, (dy, dx) in enumerate(shifts.astype(int)):
+        # A positive shift value moves the mask down/right
+        # so we need a slice from (0, 0) to (h-sy, w-sx)
+        # A negative shift value moves the mask up/left
+        # so we need a slice from (abs(sy), abs(sy)) to (h, w)
+        # The min(max(...)) etc ensure we never slice beyond the
+        # edge of the frame/mask in any situation
+        my0 = min(max(0, -dy), h)  # the negative survives max(0, ...) only when dy is negative
+        mx0 = min(max(0, -dx), w)  # the negative survives max(0, ...) only when dx is negative
+        my1 = max(min(h, h - dy), 0)
+        mx1 = max(min(w, w - dx), 0)
+        # The frame is sliced in exactly the opposite way
+        dy0 = min(max(0, dy), h)
+        dx0 = min(max(0, dx), w)
+        dy1 = max(min(h, h + dy), 0)
+        dx1 = max(min(w, w + dx), 0)
+        for mask_idx, mask in enumerate(masks):
+            mask_sub = mask[np.s_[my0: my1, mx0: mx1]]
+            if mask_sub.size == 0:
+                # zero intersection, neutral element 0. already in expected
+                continue
+            data_sub = data[frame_idx][np.s_[dy0: dy1, dx0: dx1]]
+            expected[frame_idx, mask_idx] = (mask_sub * data_sub).sum(axis=(-1, -2))
+    return expected
+
+
+def test_naive_shifted_apply():
+    shifts = np.asarray([1, -2]).astype(int)
+    mask_s = np.s_[0:15, 2:16]
+    data_s = np.s_[:, 1:16, 0:14]
+    data = _mk_random(size=(2, 16, 16))
+    mask = _mk_random(size=(16, 16))
+    assert np.allclose(
+        naive_shifted_mask_apply([mask], data, shifts).squeeze(),
+        (data[data_s] * mask[mask_s][np.newaxis, ...]).sum(axis=(-1, -2)),
+    )
+
+
+@pytest.mark.parametrize(
+    'kwargs', (
+        {},  # equivalent to use_sparse=None
+        {'use_sparse': True},
+        {'use_sparse': False},
+        {'use_sparse': 'sparse.pydata'},
+        {'use_torch': True},  # with use_sparse=None
+    )
+)
+@pytest.mark.parametrize(
+    'backend', (None, ) + ApplyMasksUDF(
+        mask_factories=lambda: np.ones((1, 1, 1)), shifts=(1, -1),
+    ).get_backends()
+)
+@pytest.mark.parametrize(
+    'mask_types', [
+        (np.asarray,),
+        (sp.csr_matrix,),
+        (np.asarray, sparse.COO.from_numpy),
+        (sparse.COO.from_numpy, sp.csc_matrix,),
+    ]
+)
+def test_shifted_masks_aux_shifts(lt_ctx, kwargs, backend, mask_types):
+    with set_device_class(get_device_class(backend)):
+        # nonsquare frames to test ordering is correct
+        num_frames, h, w = 2, 18, 12
+        data = np.random.uniform(size=(num_frames, h, w)).astype(np.float32)
+        if backend in SPARSE_BACKENDS:
+            data = _mk_random((num_frames, h, w), array_backend=SPARSE_COO, sparse_density=0.1)
+        else:
+            data = _mk_random((num_frames, h, w), array_backend=NUMPY)
+        shifts = np.random.uniform(
+            low=-5,
+            high=5,
+            size=(num_frames, 2),
+        )
+
+        masks = []
+        mask_factories = []
+        for mask_type in mask_types:
+            mask = mask_type(_mk_random(size=(h, w)))
+            masks.append(mask)
+            mask_factories.append(_make_lambda(mask))
+
+        expected = naive_shifted_mask_apply(masks, data, shifts)
+        dataset = MemoryDataSet(
+            data=data,
+            array_backends=(backend, ) if backend is not None else None
+        )
+        udf = ApplyMasksUDF(
+            mask_factories=mask_factories,
+            shifts=ApplyMasksUDF.aux_data(
+                data=shifts.ravel(),
+                kind='nav',
+                extra_shape=(2, ),
+                dtype=float,
+            ),
+            **kwargs,
+        )
+
+        use_sparse = kwargs.get('use_sparse', None)  # default value
+        # if forcing sparse on CuPy, raise, else densify to process
+        if backend in CUPY_BACKENDS and use_sparse in (True, 'sparse.pydata'):
+            with pytest.raises(ValueError):
+                # Implement like this so we can test the implementation
+                # once CUPY + sparse.pydata is actually supported
+                results = lt_ctx.run_udf(udf=udf, dataset=dataset)
+            pytest.xfail('CuPy + sparse.pydata not yet supported')
+        else:
+            results = lt_ctx.run_udf(udf=udf, dataset=dataset)
+
+        assert np.allclose(results['intensity'].data, expected)
+
+
+def test_shifted_masks_zero_overlap(lt_ctx):
+    num_frames, h, w = 2, 18, 12
+    data = _mk_random(size=(num_frames, h, w))
+
+    dataset = MemoryDataSet(data=data)
+    udf = ApplyMasksUDF(
+        mask_factories=[lambda: _mk_random(size=(h, w))],
+        shifts=(-20, 15),
+    )
+
+    results = lt_ctx.run_udf(udf=udf, dataset=dataset)
+    assert np.allclose(results['intensity'].data, 0.)
+
+
+@pytest.mark.parametrize(
+    'backend', (None, NUMPY, CUPY)
+)
+def test_shifted_masks_stacked(lt_ctx, backend):
+    with set_device_class(get_device_class(backend)):
+        # nonsquare frames to test ordering is correct
+        num_frames, h, w = 2, 18, 12
+        data = _mk_random(size=(num_frames, h, w))
+        shifts = np.random.uniform(
+            low=-5.,
+            high=5.,
+            size=(num_frames, 2),
+        )
+
+        masks = _mk_random(size=(3, h, w))
+
+        expected = naive_shifted_mask_apply(masks, data, shifts)
+        dataset = MemoryDataSet(data=data)
+        udf = ApplyMasksUDF(
+            mask_factories=lambda: masks,
+            shifts=ApplyMasksUDF.aux_data(
+                data=shifts.ravel(),
+                kind='nav',
+                extra_shape=(2, ),
+                dtype=float,
+            ),
+        )
+
+        results = lt_ctx.run_udf(udf=udf, dataset=dataset)
+        assert np.allclose(results['intensity'].data, expected)
+
+
+def test_shifted_masks_descan(lt_ctx):
+    # simulate a descan error on a constant frame
+    # check that unshifted ApplyMasksUDF has aliasing effects and that
+    # applying the shift values gives the correct constant result
+    h, w = (9, 9)
+    frame = np.zeros((h, w), dtype=int)
+    frame = circular(4, 4, w, h, 1)
+    frame_sum = frame.sum()
+    frames = []
+    shifts = np.moveaxis(np.mgrid[-2:4:2, -2:4:2], 0, -1)
+    for yroll, xroll in shifts.reshape(-1, 2):
+        frames.append(np.roll(frame, (yroll, xroll), axis=(0, 1)))
+    data = np.stack(frames, axis=0)
+    ds = lt_ctx.load('memory', data=data)
+    mask = circular(4, 4, w, h, 2)
+    udf = ApplyMasksUDF(mask_factories=[lambda: mask])
+    results = lt_ctx.run_udf(udf=udf, dataset=ds)
+    assert not (results['intensity'].data == frame_sum).all()
+    assert results['intensity'].data.reshape(3, 3)[1, 1] == frame_sum
+    udf = ApplyMasksUDF(
+        mask_factories=[lambda: mask],
+        shifts=ApplyMasksUDF.aux_data(
+            data=shifts.ravel(),
+            kind='nav',
+            extra_shape=(2, ),
+            dtype=int,
+        ),
+    )
+    results = lt_ctx.run_udf(udf=udf, dataset=ds)
+    assert (results['intensity'].data == frame_sum).all()
+
+
+def test_backend_unknown():
+    with pytest.raises(ValueError):
+        ApplyMasksUDF(
+            mask_factories=[lambda: np.ones((5, 5))],
+            backends=('BACKEND_DOES_NOT_EXIST',)
+        )

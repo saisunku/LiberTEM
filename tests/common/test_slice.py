@@ -1,5 +1,6 @@
+import pytest
 import numpy as np
-from libertem.common import Slice, Shape
+from libertem.common import Slice, Shape, SliceUsageError
 
 
 def test_subslices_simple():
@@ -317,3 +318,103 @@ def test_from_shape():
         origin=(0, 0, 0),
         shape=Shape((1, 16, 16), sig_dims=2),
     )
+
+
+def test_shift_offset_consistency():
+    offset1 = (0, -3, 5)
+    offset2 = (1, 7, -19)
+    total_offset = tuple(o1 + o2 for (o1, o2) in zip(offset1, offset2))
+    s1 = Slice.from_shape(
+        (1, 16, 16),
+        sig_dims=2
+    )
+    s2 = s1.shift_by(offset1)
+    s3 = s2.shift_by(offset2)
+    assert s3.origin == total_offset
+    assert s3.shape == s1.shape
+
+
+def test_slice_raises_not_shape():
+    with pytest.raises(SliceUsageError):
+        Slice(
+            origin=(1, 1, 1, 1),
+            shape=(2, 2, 2, 2),
+        )
+
+
+def test_slice_raises_mismatching():
+    with pytest.raises(SliceUsageError):
+        Slice(
+            origin=(1, 1, 1),
+            shape=Shape((2, 2, 2, 2), sig_dims=2),
+        )
+
+
+def test_intersections_raises_mismatching():
+    s1 = Slice(
+        origin=(1, 1, 1, 1),
+        shape=Shape((2, 2, 2, 2), sig_dims=2),
+    )
+    s2 = Slice(
+        origin=(1, 1, 1),
+        shape=Shape((2, 2, 2), sig_dims=2),
+    )
+    s3 = Slice(
+        origin=(1, 1, 1, 1),
+        shape=Shape((2, 2, 2, 2), sig_dims=1),
+    )
+    with pytest.raises(SliceUsageError):
+        s1.intersection_with(s2)
+    with pytest.raises(SliceUsageError):
+        s1.intersection_with(s3)
+
+
+def test_shifts_raises_mismatching():
+    s1 = Slice(
+        origin=(1, 1, 1, 1),
+        shape=Shape((2, 2, 2, 2), sig_dims=2),
+    )
+    s2 = Slice(
+        origin=(1, 1, 1),
+        shape=Shape((2, 2, 2), sig_dims=2),
+    )
+    with pytest.raises(SliceUsageError):
+        s1.shift(s2)
+    with pytest.raises(SliceUsageError):
+        s1.shift_by(s2.origin)
+
+
+def test_adjust_for_roi_sig_dims_zero():
+    """
+    Test if `adjust_for_roi` causes a length mismatch due to the `[-0:]`.
+    """
+    # 1. Create a Slice object with sig_dims = 0
+    # Assuming a 1D Navigation dimension and no Signal dimension
+    nav_shape = (10,)
+    sig_shape = ()
+    shape = Shape(nav_shape + sig_shape, sig_dims=0)
+
+    initial_slice = Slice(
+        origin=(0,),
+        shape=shape
+    )
+
+    # 2. Simulate running adjust_for_roi
+    # Set roi to a simple boolean mask
+    roi = np.ones((10,), dtype=bool)
+
+    print(f"\nInitial Slice origin length: {len(initial_slice.origin)}")
+    print(f"Signal dimensions (sig_dims): {initial_slice.shape.sig.dims}")
+
+    # 3. Expected behavior: This should execute smoothly without errors.
+    # Actual behavior in buggy versions: Throws a SliceUsageError.
+    try:
+        new_slice = initial_slice.adjust_for_roi(roi)
+        print(f"Success! New Slice origin is: {new_slice.origin}")
+    except Exception as e:
+        print(f"Crash! Error message: {e}")
+        # If it's the expected length mismatch error, fail the test explicitly
+        if "origin and shape must have same length" in str(e):
+            pytest.fail("Triggered SliceUsageError: This is due to the `[-0:]` slicing syntax bug.")
+        # If it's a different unexpected error, raise it normally
+        raise e

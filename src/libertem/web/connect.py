@@ -1,18 +1,14 @@
 import logging
-from functools import partial
 from typing import TYPE_CHECKING
 
 import tornado.web
 from opentelemetry import trace
 
-from libertem.executor.base import AsyncAdapter
-from libertem.common.async_utils import sync_to_async
-from libertem.executor.dask import DaskJobExecutor, cluster_spec
 from libertem.web.engine import JobEngine
+from libertem.executor.base import AsyncAdapter
 from .messages import Message
 from .base import log_message
 from .state import SharedState
-from libertem.utils.devices import detect
 
 log = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
@@ -30,7 +26,7 @@ class ConnectHandler(tornado.web.RequestHandler):
     async def get(self):
         log.info("ConnectHandler.get")
         try:
-            self.state.executor_state.get_executor()
+            await self.state.executor_state.get_executor()
             params = self.state.executor_state.get_cluster_params()
             # TODO: extract into Message class
             self.write({
@@ -51,48 +47,20 @@ class ConnectHandler(tornado.web.RequestHandler):
     async def _do_connect(self):
         # TODO: extract json request data stuff into mixin?
         request_data = tornado.escape.json_decode(self.request.body)
-        connection = request_data['connection']
         pool = AsyncAdapter.make_pool()
         with tracer.start_as_current_span("executor setup"):
-            if connection["type"].lower() == "tcp":
-                try:
-                    sync_executor = await sync_to_async(partial(DaskJobExecutor.connect,
-                        scheduler_uri=connection['address'],
-                    ), pool=pool)
-                except Exception as e:
-                    msg = Message(self.state).cluster_conn_error(msg=str(e))
-                    log_message(msg)
-                    self.write(msg)
-                    return None
-            elif connection["type"].lower() == "local":
-                devices = detect()
-                options = {
-                    "local_directory": self.state.get_local_directory()
-                }
-                try:
-                    if "numWorkers" in connection:
-                        num_workers = connection["numWorkers"]
-                        if not isinstance(num_workers, int) or num_workers < 1:
-                            raise ValueError('Number of workers must be positive integer')
-                        devices["cpus"] = range(num_workers)
-                    devices["cudas"] = connection.get("cudas", [])
-                    sync_executor = await sync_to_async(partial(DaskJobExecutor.make_local,
-                        spec=cluster_spec(**devices,
-                                          options=options,
-                                          preload=self.state.get_preload())
-                    ), pool=pool)
-                except Exception as e:
-                    msg = Message(self.state).cluster_conn_error(msg=str(e))
-                    log_message(msg)
-                    self.write(msg)
-                    return None
-            else:
-                raise ValueError("unknown connection type")
-            executor = AsyncAdapter(wrapped=sync_executor, pool=pool)
+            try:
+                executor = await self.state.executor_state.make_executor(request_data, pool)
+            except Exception as e:
+                msg = Message().cluster_conn_error(msg=str(e))
+                log_message(msg, exception=True)
+                self.set_status(500)
+                self.write(msg)
+                return None
             await self.state.executor_state.set_executor(executor, request_data)
         await self.state.dataset_state.verify()
         datasets = await self.state.dataset_state.serialize_all()
-        msg = Message(self.state).initial_state(
+        msg = Message().initial_state(
             jobs=self.state.job_state.serialize_all(),
             datasets=datasets, analyses=self.state.analysis_state.serialize_all(),
             compound_analyses=self.state.compound_analysis_state.serialize_all(),
@@ -104,5 +72,5 @@ class ConnectHandler(tornado.web.RequestHandler):
         await self.engine.send_existing_job_results()
         self.write({
             "status": "ok",
-            "connection": connection,
+            "connection": request_data['connection'],
         })

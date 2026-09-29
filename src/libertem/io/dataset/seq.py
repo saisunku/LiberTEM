@@ -29,7 +29,6 @@
 import os
 import struct
 import warnings
-from typing import Tuple
 
 import defusedxml.ElementTree as ET
 import numpy as np
@@ -436,6 +435,11 @@ class SEQDataSet(DataSet):
     sync_offset: int, optional
         If positive, number of frames to skip from start.
         If negative, number of blank frames to insert at start.
+    num_partitions: int, optional
+        Override the number of partitions. This is useful if the
+        default number of partitions, chosen based on common workloads,
+        creates partitions which are too large (or small) for the UDFs
+        being run on this dataset.
 
     Note
     ----
@@ -456,9 +460,20 @@ class SEQDataSet(DataSet):
     FIXME find public documentation of the XML format and dark/gain maps.
     """
 
-    def __init__(self, path: str, scan_size: Tuple[int] = None, nav_shape: Tuple[int] = None,
-                 sig_shape: Tuple[int] = None, sync_offset: int = 0, io_backend=None):
-        super().__init__(io_backend=io_backend)
+    def __init__(
+        self,
+        path: str,
+        scan_size: tuple[int, ...] | None = None,
+        nav_shape: tuple[int, ...] | None = None,
+        sig_shape: tuple[int, ...] | None = None,
+        sync_offset: int = 0,
+        io_backend=None,
+        num_partitions=None,
+    ):
+        super().__init__(
+            io_backend=io_backend,
+            num_partitions=num_partitions,
+        )
         self._path = path
         # There might be '.seq.seq' and '.seq' in the wild
         # See https://github.com/LiberTEM/LiberTEM/issues/1120
